@@ -190,26 +190,11 @@ pub fn normalize(
     }
 
     // 1. Trim common suffix, then common prefix. Track how the interval shrinks.
-    let (mut ref_seq, mut alt_seq) = (ref_bases.clone(), alt.clone());
-    let mut new_start = start;
-    let mut new_end = end;
-
-    // common suffix
-    while !ref_seq.is_empty() && !alt_seq.is_empty() && ref_seq.last() == alt_seq.last() {
-        ref_seq.pop();
-        alt_seq.pop();
-        new_end -= 1;
-    }
-    // common prefix
-    let mut pfx = 0;
-    while pfx < ref_seq.len() && pfx < alt_seq.len() && ref_seq[pfx] == alt_seq[pfx] {
-        pfx += 1;
-    }
-    if pfx > 0 {
-        ref_seq.drain(0..pfx);
-        alt_seq.drain(0..pfx);
-        new_start += pfx;
-    }
+    let (pfx, sfx) = trim_common(&ref_bases, &alt);
+    let ref_seq = ref_bases[pfx..ref_bases.len() - sfx].to_vec();
+    let alt_seq = alt[pfx..alt.len() - sfx].to_vec();
+    let new_start = start + pfx;
+    let new_end = end - sfx;
 
     // 2. If both sides are non-empty after trimming, it's a substitution / MNV — VRS
     //    does not roll these; return the trimmed form as a LiteralSequenceExpression
@@ -237,6 +222,26 @@ pub fn normalize(
     Ok(justify_expand(
         reference, new_start, new_end, &ref_seq, &alt_seq, seed_length,
     ))
+}
+
+/// The reference-free part of VRS normalization: the lengths of the common suffix and
+/// common prefix (trimmed in that order, matching vrs-python) shared by a REF/ALT pair.
+/// Returns `(prefix_len, suffix_len)`; the trims never overlap. The no-reference
+/// projections use this too, so a padded substitution (`GT>GA`) reaches the same trimmed
+/// interval — and therefore the same VRS id — with or without a reference FASTA.
+pub fn trim_common(reference: &[u8], alt: &[u8]) -> (usize, usize) {
+    let mut sfx = 0;
+    while sfx < reference.len().min(alt.len())
+        && reference[reference.len() - 1 - sfx] == alt[alt.len() - 1 - sfx]
+    {
+        sfx += 1;
+    }
+    let (r, a) = (&reference[..reference.len() - sfx], &alt[..alt.len() - sfx]);
+    let mut pfx = 0;
+    while pfx < r.len().min(a.len()) && r[pfx] == a[pfx] {
+        pfx += 1;
+    }
+    (pfx, sfx)
 }
 
 /// bioutils/vrs-python EXPAND-mode justification. `del` is the (trimmed) deleted
@@ -513,6 +518,20 @@ mod tests {
             n.state,
             NormalizedState::ReferenceLengthExpression { length: 14, repeat_subunit_length: 4 }
         );
+    }
+
+    #[test]
+    fn trim_common_trims_suffix_then_prefix() {
+        assert_eq!(trim_common(b"GT", b"GA"), (1, 0));
+        assert_eq!(trim_common(b"TG", b"AG"), (0, 1));
+        assert_eq!(trim_common(b"ACGT", b"AGGT"), (1, 2));
+        assert_eq!(trim_common(b"A", b"T"), (0, 0));
+        // Padded indels: the suffix is consumed first, matching `normalize`.
+        assert_eq!(trim_common(b"AA", b"A"), (0, 1));
+        assert_eq!(trim_common(b"A", b"AA"), (0, 1));
+        // Identity is consumed entirely by the suffix pass; the trims never overlap.
+        assert_eq!(trim_common(b"AT", b"AT"), (0, 2));
+        assert_eq!(trim_common(b"", b""), (0, 0));
     }
 
     #[test]

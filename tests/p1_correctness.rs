@@ -265,6 +265,75 @@ fn partially_missing_genotype_is_not_hemizygous() {
     }
 }
 
+/// P2: a padded same-length substitution (REF=GT ALT=GA — the shared G pads a T>A) was
+/// projected untrimmed by the no-reference path, minting a non-canonical id with no
+/// `fullyJustified` marker, while the same row with `--reference` produced the trimmed
+/// canonical id. Trimming needs no reference, so both paths must agree — in both formats.
+#[test]
+fn padded_substitutions_reach_the_canonical_id_without_a_reference() {
+    let f = Fixture::new();
+    for maf in [false, true] {
+        // SEQUENCE is CGTAAAAAAC…: GT spans 1-based [2,3], so GT>GA is T>A at pos 3.
+        let mut ids = Vec::new();
+        for reference in [None, Some("ref.fa")] {
+            let output = f.run(maf, &row(maf, 2, "GT", "GA"), reference, &[]);
+            assert!(output.status.success(), "{output:?}");
+            let alleles = f.json("alleles.ndjson");
+            assert_eq!(alleles.len(), 1);
+            assert!(
+                alleles[0].get("fullyJustified").is_none(),
+                "a substitution is exact and must not be flagged: {alleles:#?}"
+            );
+            assert_eq!(alleles[0]["state"]["sequence"], "A", "common prefix not trimmed");
+            assert_eq!(alleles[0]["location"]["start"], 2);
+            assert_eq!(alleles[0]["location"]["end"], 3);
+            ids.push(alleles[0]["id"].clone());
+        }
+        assert_eq!(ids[0], ids[1], "naive and normalized ids diverged (maf={maf})");
+    }
+}
+
+/// P2: the VCF path minted `ga4gh:VA.` ids for non-ACGTN REF/ALT strings (IUPAC codes,
+/// caller junk) that the MAF path routes away from VRS identity. Both front ends must
+/// enforce the same policy: no id, loud count, and the rest of the file still converts.
+#[test]
+fn non_nucleotide_vcf_alleles_are_skipped_not_minted() {
+    let f = Fixture::new();
+    let rows = row(false, 4, "A", "Z") + &row(false, 5, "A", "R") + &row(false, 4, "A", "T");
+    for reference in [None, Some("ref.fa")] {
+        let output = f.run(false, &rows, reference, &[]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("2 variant-allele(s) with non-ACGTN REF/ALT skipped"),
+            "{stderr}"
+        );
+        let alleles = f.json("alleles.ndjson");
+        assert_eq!(alleles.len(), 1, "only the valid row mints an id: {alleles:#?}");
+        assert_eq!(alleles[0]["state"]["sequence"], "T");
+        assert_eq!(f.json("obs.ndjson").len(), 1);
+    }
+}
+
+/// P2 follow-up: an identity row (REF == ALT) got a LiteralSequenceExpression id from
+/// the no-reference path but a ReferenceLengthExpression id with `--reference`. The
+/// identity state is decidable without a reference, so the paths must agree.
+#[test]
+fn identity_alleles_agree_across_naive_and_normalized_paths() {
+    let f = Fixture::new();
+    let mut ids = Vec::new();
+    for reference in [None, Some("ref.fa")] {
+        let output = f.run(false, &row(false, 4, "A", "A"), reference, &[]);
+        assert!(output.status.success(), "{output:?}");
+        let alleles = f.json("alleles.ndjson");
+        assert_eq!(alleles.len(), 1);
+        assert_eq!(alleles[0]["state"]["type"], "ReferenceLengthExpression");
+        assert!(alleles[0].get("fullyJustified").is_none());
+        ids.push(alleles[0]["id"].clone());
+    }
+    assert_eq!(ids[0], ids[1]);
+}
+
 /// P2 follow-up: a rejected row used `unknown` in its local variant id when the MAF
 /// omitted NCBI_Build, even though the resolved seqmap supplied an assembly that was
 /// copied onto the observation. The node and observation must derive assembly once.

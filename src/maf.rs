@@ -226,13 +226,16 @@ fn canonical_build(build: &str) -> String {
 
 /// Build a VRS allele for a MAF interval. With `reference` the allele is fully
 /// justified; without it the trimmed projection is used, which is exact for
-/// substitutions but not guaranteed canonical for indels in repeats.
+/// substitutions but not guaranteed canonical for indels in repeats. The returned bool
+/// says whether the id is exact ("fully justified"): always with a reference, and for
+/// substitutions without one — MAF alleles are trimmed by convention, but rows that
+/// arrive padded are re-trimmed here so they reach the canonical id too.
 /// With a reference, returns an error for interval, REF, or seqmap identity mismatches.
 pub fn build_maf_allele(
     seq: &SeqInfo,
     interval: &MafInterval,
     reference: Option<&dyn crate::normalize::Reference>,
-) -> Result<Allele> {
+) -> Result<(Allele, bool)> {
     ensure!(
         interval.start >= 0 && interval.end >= interval.start,
         "invalid MAF interval"
@@ -268,16 +271,42 @@ pub fn build_maf_allele(
                     sequence: (alt.len() <= 50).then_some(alt),
                 },
             };
-            allele_at(seq, n.start as i64, n.end as i64, state)
+            (allele_at(seq, n.start as i64, n.end as i64, state), true)
         }
-        None => allele_at(
-            seq,
-            interval.start,
-            interval.end,
-            State::LiteralSequenceExpression {
-                sequence: interval.alt.clone(),
-            },
-        ),
+        None => {
+            ensure!(
+                !(interval.reference.is_empty() && interval.alt.is_empty()),
+                "cannot build an allele from an empty no-op edit"
+            );
+            // Identity allele: the same RLE state `normalize` chooses (exact — no indel
+            // unit moves), so the id agrees with the reference-based path.
+            if interval.reference == interval.alt {
+                let state = State::ReferenceLengthExpression {
+                    length: interval.alt.len() as i64,
+                    repeat_subunit_length: interval.alt.len() as i64,
+                    sequence: (interval.alt.len() <= 50).then_some(interval.alt.clone()),
+                };
+                return Ok((allele_at(seq, interval.start, interval.end, state), true));
+            }
+            // Reference-free trimming: exact for substitutions (the trimmed literal is
+            // canonical); a pure indel still needs a reference to justify across repeats.
+            let (pfx, sfx) = crate::normalize::trim_common(
+                interval.reference.as_bytes(),
+                interval.alt.as_bytes(),
+            );
+            let alt = String::from_utf8_lossy(
+                &interval.alt.as_bytes()[pfx..interval.alt.len() - sfx],
+            )
+            .to_string();
+            let is_substitution = interval.reference.len() > pfx + sfx && !alt.is_empty();
+            let allele = allele_at(
+                seq,
+                interval.start + pfx as i64,
+                interval.end - sfx as i64,
+                State::LiteralSequenceExpression { sequence: alt },
+            );
+            (allele, is_substitution)
+        }
     })
 }
 

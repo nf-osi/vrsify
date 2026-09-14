@@ -141,7 +141,10 @@ study id, and MAF's own annotation columns (`Variant_Classification`, `Consequen
 
 ## Indels, and why `--reference` matters
 
-Substitutions are byte-exact without a reference. Indels are not: the same insertion or
+Substitutions are byte-exact without a reference: the common REF/ALT prefix and suffix
+are trimmed either way (that part of VRS normalization needs no sequence lookup), so even
+a padded spelling like `GT>GA` reaches the canonical id of the underlying `T>A`. Indels
+are not: the same insertion or
 deletion inside a homopolymer or tandem repeat can be written at several positions, and
 VRS resolves that by **fully justifying** the variant — rolling it as far left and as far
 right as the reference allows — before hashing. That requires the reference sequence.
@@ -208,7 +211,10 @@ run summary rather than failing the row.
   the allele (28% of rows in one study we ingested). Recording those as "this specimen
   carries this variant" would be wrong, so pass `--min-tumor-alt-count 1` when that
   applies; nothing is filtered unless you ask.
-- Symbolic and structural VCF ALTs (`<DEL>`, breakends) are skipped and counted.
+- Symbolic and structural VCF ALTs (`<DEL>`, breakends) are skipped and counted, and —
+  matching the MAF rule above — VCF records whose REF or ALT is not plain `ACGTN`
+  (IUPAC ambiguity codes, caller junk) are never given a VRS id; they are skipped and
+  counted in a warning.
 
 ## Correctness
 
@@ -225,7 +231,9 @@ VRS ids are worthless unless they are byte-identical to everyone else's.
 - fully-justified normalization (left- and right-shifted representations of one indel
   must converge) and `seqmap` generation, on synthetic references;
 - missing MAF alleles, reference/seqmap identity and REF mismatches, interval bounds,
-  identity-allele normalization, and warnings/markers for VCF indels without a reference.
+  identity-allele normalization, and warnings/markers for VCF indels without a reference;
+- reference-free trimming (padded substitutions reach the canonical id with or without
+  `--reference`, in both formats) and the non-ACGTN skip on the VCF path.
 
 Two checks need multi-GB reference files and so are not part of `cargo test`, but were
 run against real data: `vrsify seqmap` over GRCh38 chr19 reproduces GA4GH's canonical

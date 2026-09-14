@@ -211,6 +211,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let mut n_alleles = 0u64;
     let mut n_obs = 0u64;
     let mut n_skipped_alt = 0u64;
+    let mut n_non_nucleotide = 0u64;
     let mut n_not_fully_justified = 0u64;
     let mut missing_contigs: HashSet<String> = HashSet::new();
 
@@ -251,6 +252,12 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                 n_skipped_alt += 1;
                 continue;
             }
+            // Same identity policy as the MAF front end: a non-ACGTN REF or ALT (IUPAC
+            // codes, caller junk) must never be given a `ga4gh:VA.` id.
+            if !is_nucleotide_sequence(&reference) || !is_nucleotide_sequence(alt) {
+                n_non_nucleotide += 1;
+                continue;
+            }
             n_variants += 1;
 
             let refseq = references
@@ -260,15 +267,17 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                         .with_context(|| format!("reference FASTA is missing contig '{chrom}'"))
                 })
                 .transpose()?;
-            let fully_justified = refseq.is_some() || reference.len() == alt.len();
+            let (allele, fully_justified) = match refseq {
+                Some(refseq) => (
+                    build_allele_normalized(seq, pos, &reference, alt, refseq)
+                        .with_context(|| format!("VCF {chrom}:{pos} {reference}>{alt}"))?,
+                    true,
+                ),
+                None => build_allele(seq, pos, &reference, alt),
+            };
             if !fully_justified {
                 n_not_fully_justified += 1;
             }
-            let allele = match refseq {
-                Some(refseq) => build_allele_normalized(seq, pos, &reference, alt, refseq)
-                    .with_context(|| format!("VCF {chrom}:{pos} {reference}>{alt}"))?,
-                None => build_allele(seq, pos, &reference, alt),
-            };
             let vid = allele.ga4gh_id();
 
             if seen_alleles.insert(vid.clone()) {
@@ -319,6 +328,12 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         "vrsify: {n_variants} variant-alleles, {n_alleles} unique, {n_obs} observations, \
          {n_skipped_alt} non-concrete ALTs skipped"
     );
+    if n_non_nucleotide > 0 {
+        eprintln!(
+            "vrsify: WARNING — {n_non_nucleotide} variant-allele(s) with non-ACGTN REF/ALT \
+             skipped (no VRS id minted)"
+        );
+    }
     if n_not_fully_justified > 0 {
         eprintln!(
             "vrsify: WARNING — {n_not_fully_justified} indel allele(s) are NOT fully justified \
@@ -589,14 +604,14 @@ fn run_maf(args: MafArgs) -> Result<()> {
                 })
             })
             .transpose()?;
-        let fully_justified = ref_seq.is_some() || !interval.is_indel();
+
+        let (allele, fully_justified) =
+            build_maf_allele(seq, &interval, ref_seq).with_context(|| {
+                format!("MAF row {} ({contig}:{start} {ref_raw}>{alt_raw})", c.rows)
+            })?;
         if !fully_justified {
             c.not_fully_justified += 1;
         }
-
-        let allele = build_maf_allele(seq, &interval, ref_seq).with_context(|| {
-            format!("MAF row {} ({contig}:{start} {ref_raw}>{alt_raw})", c.rows)
-        })?;
         let vid = allele.ga4gh_id();
         if seen_alleles.insert(vid.clone()) {
             let mut value = allele.to_output_value();

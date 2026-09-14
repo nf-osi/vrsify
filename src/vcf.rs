@@ -6,12 +6,13 @@
 //! `is_concrete_alt`, annotation parsing) operate on the string values noodles yields.
 //!
 //! Scope / limitations:
-//!   * Coordinates default to the *naive* VCF→VRS projection: `start = POS-1`
-//!     (interbase), `end = POS-1+len(REF)`, `state = alt` — correct for SNVs and for
-//!     already left-aligned input. Run `bcftools norm -m- -f REF` upstream. The
-//!     reference-based "fully justified" VRS normalization (in `normalize.rs`) is
-//!     applied when a reference FASTA is supplied.
-//!   * Symbolic/structural ALTs (`<DEL>`, breakends) are skipped and counted.
+//!   * Without a reference FASTA, the VCF→VRS projection trims the common REF/ALT
+//!     suffix/prefix (the reference-free part of VRS normalization), so substitutions —
+//!     including padded ones like `GT>GA` — are exact; pure indels still need the
+//!     reference-based "fully justified" normalization (in `normalize.rs`), applied when
+//!     a reference FASTA is supplied. Run `bcftools norm -m- -f REF` upstream as usual.
+//!   * Symbolic/structural ALTs (`<DEL>`, breakends) and non-ACGTN REF/ALT strings are
+//!     skipped and counted (the latter in `main.rs`, mirroring the MAF front end).
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -87,20 +88,48 @@ pub fn resolve_contig<'a>(map: &'a SeqMap, name: &str) -> Option<(&'a str, &'a S
     map.get_key_value(stripped).map(|(k, v)| (k.as_str(), v))
 }
 
-/// Build a VRS Allele from a (contig, 1-based POS, REF, ALT) tuple, naive projection.
-/// Correct for SNVs and already-left-aligned input; for indels in repeats use
-/// [`build_allele_normalized`] with a reference.
-pub fn build_allele(seq: &SeqInfo, pos_1based: i64, reference: &str, alt: &str) -> Allele {
-    let start = pos_1based - 1;
-    let end = start + reference.len() as i64;
-    allele_from_interval(seq, start, end, alt)
-}
-
-fn allele_from_interval(seq: &SeqInfo, start: i64, end: i64, alt: &str) -> Allele {
+/// Build a VRS Allele from a (contig, 1-based POS, REF, ALT) tuple without a reference
+/// sequence, applying the reference-free part of VRS normalization: common suffix/prefix
+/// trimming ([`crate::normalize::trim_common`]) plus the identity-allele RLE state. The
+/// returned bool says whether the id is exact ("fully justified"): true for
+/// substitutions and identity alleles — a padded `GT>GA` reaches the same id as the
+/// reference-based path — false for pure indels, which need a reference to justify
+/// across repeats (use [`build_allele_normalized`]).
+pub fn build_allele(seq: &SeqInfo, pos_1based: i64, reference: &str, alt: &str) -> (Allele, bool) {
     // VCF nucleotide strings are case-insensitive (VCF 4.x sec. 1.6.1: bases may be in
     // either case), so `A>t` and `A>T` are the same edit and must hash to one id. The
     // reference-based path gets this from `normalize`, which uppercases internally.
+    let reference = reference.to_ascii_uppercase();
     let alt = alt.to_ascii_uppercase();
+    let start = pos_1based - 1;
+    let end = start + reference.len() as i64;
+
+    // Identity allele: the same RLE state `normalize` chooses, so the id agrees with the
+    // reference-based path (which is exact here — no indel unit moves).
+    if reference == alt {
+        let state = State::ReferenceLengthExpression {
+            length: alt.len() as i64,
+            repeat_subunit_length: alt.len() as i64,
+            sequence: (alt.len() <= 50).then_some(alt),
+        };
+        return (allele_at(seq, start, end, state), true);
+    }
+
+    let (pfx, sfx) = crate::normalize::trim_common(reference.as_bytes(), alt.as_bytes());
+    let trimmed_alt = String::from_utf8_lossy(&alt.as_bytes()[pfx..alt.len() - sfx]).to_string();
+    // Both sides non-empty after trimming → substitution/MNV, which VRS does not roll:
+    // the trimmed literal IS the canonical form. One side empty → pure indel, not exact.
+    let is_substitution = reference.len() > pfx + sfx && !trimmed_alt.is_empty();
+    let allele = allele_at(
+        seq,
+        start + pfx as i64,
+        end - sfx as i64,
+        State::LiteralSequenceExpression { sequence: trimmed_alt },
+    );
+    (allele, is_substitution)
+}
+
+fn allele_at(seq: &SeqInfo, start: i64, end: i64, state: State) -> Allele {
     Allele {
         location: SequenceLocation {
             sequence_reference: SequenceReference {
@@ -109,7 +138,7 @@ fn allele_from_interval(seq: &SeqInfo, start: i64, end: i64, alt: &str) -> Allel
             start: Some(Coordinate::Definite(start)),
             end: Some(Coordinate::Definite(end)),
         },
-        state: State::LiteralSequenceExpression { sequence: alt },
+        state,
     }
 }
 
@@ -478,16 +507,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn snv_allele_shape() {
-        let seq = SeqInfo {
+    fn test_seq() -> SeqInfo {
+        SeqInfo {
             refget: "SQ.test".into(),
             assembly: Some("GRCh38".into()),
             reference_name: "17".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn snv_allele_shape() {
         // A C>T SNV at 1-based POS 100 → interbase [99,100), state "T".
-        let a = build_allele(&seq, 100, "C", "T");
+        let (a, exact) = build_allele(&test_seq(), 100, "C", "T");
+        assert!(exact, "an SNV is exact without a reference");
         // ga4gh_serialize should reference location by digest and inline state.
         assert!(a.ga4gh_id().starts_with("ga4gh:VA."));
+    }
+
+    #[test]
+    fn padded_substitution_trims_to_the_canonical_literal() {
+        let seq = test_seq();
+        // GT>GA at POS 100: the shared G pads the real T>A at 101. The trimmed form is
+        // the canonical VRS literal, so the padded and minimal spellings share one id.
+        let (padded, exact) = build_allele(&seq, 100, "GT", "GA");
+        assert!(exact, "a substitution is exact after trimming");
+        let (minimal, _) = build_allele(&seq, 101, "T", "A");
+        assert_eq!(padded.ga4gh_id(), minimal.ga4gh_id());
+        // Suffix pads trim too, shrinking `end`.
+        let (suffix_padded, _) = build_allele(&seq, 101, "TG", "AG");
+        assert_eq!(suffix_padded.ga4gh_id(), minimal.ga4gh_id());
+    }
+
+    #[test]
+    fn identity_allele_matches_the_normalized_rle_state() {
+        // REF == ALT: `normalize` emits an RLE spanning the original interval; the
+        // no-reference path must mint the same id, not a LiteralSequenceExpression.
+        let (a, exact) = build_allele(&test_seq(), 100, "AT", "AT");
+        assert!(exact);
+        let v = a.to_output_value();
+        assert_eq!(v["state"]["type"], "ReferenceLengthExpression");
+        assert_eq!(v["state"]["length"], 2);
+        assert_eq!(v["state"]["repeatSubunitLength"], 2);
+        assert_eq!(v["location"]["start"], 99);
+        assert_eq!(v["location"]["end"], 101);
+    }
+
+    #[test]
+    fn pure_indels_are_trimmed_but_not_exact() {
+        let seq = test_seq();
+        // Padded deletion AA>A: trims to a 1-base deletion, but justification across the
+        // repeat needs a reference, so it is not exact.
+        let (del, exact) = build_allele(&seq, 100, "AA", "A");
+        assert!(!exact, "a pure indel cannot be exact without a reference");
+        let v = del.to_output_value();
+        assert_eq!(v["state"]["sequence"], "");
+        assert_eq!(v["location"]["start"], 99);
+        assert_eq!(v["location"]["end"], 100);
+        let (_, exact) = build_allele(&seq, 100, "A", "AA");
+        assert!(!exact);
     }
 }
