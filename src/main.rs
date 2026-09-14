@@ -65,7 +65,7 @@ struct ConvertArgs {
     out_observations: Option<PathBuf>,
 
     /// Reference FASTA (optional). When supplied, indels are fully-justified normalized
-    /// against the reference; otherwise the naive projection is used.
+    /// against the validated reference; otherwise indels are marked fullyJustified=false.
     #[arg(long)]
     reference: Option<PathBuf>,
 
@@ -211,6 +211,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let mut n_alleles = 0u64;
     let mut n_obs = 0u64;
     let mut n_skipped_alt = 0u64;
+    let mut n_not_fully_justified = 0u64;
     let mut missing_contigs: HashSet<String> = HashSet::new();
 
     for result in reader.records() {
@@ -250,18 +251,30 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             }
             n_variants += 1;
 
-            let allele = match references.as_ref().and_then(|r| r.contig(&chrom)) {
-                Some(refseq) => build_allele_normalized(seq, pos, &reference, alt, refseq),
+            let refseq = references
+                .as_ref()
+                .map(|r| {
+                    r.contig(&chrom)
+                        .with_context(|| format!("reference FASTA is missing contig '{chrom}'"))
+                })
+                .transpose()?;
+            let fully_justified = refseq.is_some() || reference.len() == alt.len();
+            if !fully_justified {
+                n_not_fully_justified += 1;
+            }
+            let allele = match refseq {
+                Some(refseq) => build_allele_normalized(seq, pos, &reference, alt, refseq)
+                    .with_context(|| format!("VCF {chrom}:{pos} {reference}>{alt}"))?,
                 None => build_allele(seq, pos, &reference, alt),
             };
             let vid = allele.ga4gh_id();
 
             if seen_alleles.insert(vid.clone()) {
-                writeln!(
-                    allele_out,
-                    "{}",
-                    serde_json::to_string(&allele.to_output_value())?
-                )?;
+                let mut value = allele.to_output_value();
+                if !fully_justified {
+                    value["fullyJustified"] = false.into();
+                }
+                writeln!(allele_out, "{}", serde_json::to_string(&value)?)?;
                 n_alleles += 1;
             }
 
@@ -304,6 +317,12 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         "vrsify: {n_variants} variant-alleles, {n_alleles} unique, {n_obs} observations, \
          {n_skipped_alt} non-concrete ALTs skipped"
     );
+    if n_not_fully_justified > 0 {
+        eprintln!(
+            "vrsify: WARNING — {n_not_fully_justified} indel allele(s) are NOT fully justified \
+             (no --reference); their ga4gh ids may not match normalized variants"
+        );
+    }
     if !missing_contigs.is_empty() {
         let mut v: Vec<_> = missing_contigs.into_iter().collect();
         v.sort();
@@ -410,8 +429,18 @@ fn run_maf(args: MafArgs) -> Result<()> {
         let end: Option<i64> = header.get(&row, "End_Position").and_then(|v| v.parse().ok());
 
         // MAF-form alleles, `-` placeholders preserved for the observation record.
-        let ref_raw = header.get(&row, "Reference_Allele").unwrap_or("-");
-        let tsa2_raw = header.get(&row, "Tumor_Seq_Allele2").unwrap_or("-");
+        let ref_raw = header.get(&row, "Reference_Allele").with_context(|| {
+            format!(
+                "MAF row {}: missing Reference_Allele; use '-' only for an explicit empty allele",
+                c.rows
+            )
+        })?;
+        let tsa2_raw = header.get(&row, "Tumor_Seq_Allele2").with_context(|| {
+            format!(
+                "MAF row {}: missing Tumor_Seq_Allele2; use '-' only for an explicit empty allele",
+                c.rows
+            )
+        })?;
         let tsa1_raw = header.get(&row, "Tumor_Seq_Allele1").unwrap_or(ref_raw);
         let reference_allele = allele_bases(Some(ref_raw));
         let Some(alt_raw) = effective_alt(ref_raw, tsa2_raw, tsa1_raw) else {
@@ -495,13 +524,20 @@ fn run_maf(args: MafArgs) -> Result<()> {
 
         let ref_seq = references
             .as_ref()
-            .and_then(|r| reference_contig(r, &[seqmap_key, contig.as_str()]));
+            .map(|r| {
+                reference_contig(r, &[seqmap_key, contig.as_str()]).with_context(|| {
+                    format!("MAF row {}: reference FASTA is missing contig '{contig}'", c.rows)
+                })
+            })
+            .transpose()?;
         let fully_justified = ref_seq.is_some() || !interval.is_indel();
         if !fully_justified {
             c.not_fully_justified += 1;
         }
 
-        let allele = build_maf_allele(seq, &interval, ref_seq);
+        let allele = build_maf_allele(seq, &interval, ref_seq).with_context(|| {
+            format!("MAF row {} ({contig}:{start} {ref_raw}>{alt_raw})", c.rows)
+        })?;
         let vid = allele.ga4gh_id();
         if seen_alleles.insert(vid.clone()) {
             let mut value = allele.to_output_value();

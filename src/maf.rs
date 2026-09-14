@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::io::BufRead;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde_json::{Map, Value};
 
 use crate::vcf::SeqInfo;
@@ -160,20 +160,25 @@ pub fn maf_to_interbase(
                 alt,
                 reference,
             },
-            start_position + 1,
+            start_position
+                .checked_add(1)
+                .context("insertion coordinate overflow")?,
         )
     } else {
         // Substitution or deletion: `Reference_Allele` spans 1-based
         // [Start_Position, Start_Position + len - 1] → interbase [Start-1, Start-1+len).
         let len = reference.len() as i64;
+        let end = (start_position - 1)
+            .checked_add(len)
+            .context("REF interval overflow")?;
         (
             MafInterval {
                 start: start_position - 1,
-                end: start_position - 1 + len,
+                end,
                 alt,
                 reference,
             },
-            start_position + len - 1,
+            end,
         )
     };
 
@@ -222,20 +227,34 @@ fn canonical_build(build: &str) -> String {
 /// Build a VRS allele for a MAF interval. With `reference` the allele is fully
 /// justified; without it the trimmed projection is used, which is exact for
 /// substitutions but not guaranteed canonical for indels in repeats.
+/// With a reference, returns an error for interval, REF, or seqmap identity mismatches.
 pub fn build_maf_allele(
     seq: &SeqInfo,
     interval: &MafInterval,
     reference: Option<&dyn crate::normalize::Reference>,
-) -> Allele {
-    match reference {
+) -> Result<Allele> {
+    ensure!(
+        interval.start >= 0 && interval.end >= interval.start,
+        "invalid MAF interval"
+    );
+    Ok(match reference {
         Some(ref_seq) => {
             use crate::normalize::NormalizedState;
+            let start = usize::try_from(interval.start).context("MAF start is too large")?;
+            let end = usize::try_from(interval.end).context("MAF end is too large")?;
+            crate::normalize::validate_reference(
+                ref_seq,
+                start,
+                end,
+                interval.reference.as_bytes(),
+                &seq.refget,
+            )?;
             let n = crate::normalize::normalize(
                 ref_seq,
-                interval.start as usize,
-                interval.end as usize,
+                start,
+                end,
                 interval.alt.as_bytes(),
-            );
+            )?;
             let alt = String::from_utf8_lossy(&n.alt).to_string();
             let state = match n.state {
                 NormalizedState::Literal => State::LiteralSequenceExpression { sequence: alt },
@@ -259,7 +278,7 @@ pub fn build_maf_allele(
                 sequence: interval.alt.clone(),
             },
         ),
-    }
+    })
 }
 
 fn allele_at(seq: &SeqInfo, start: i64, end: i64, state: State) -> Allele {

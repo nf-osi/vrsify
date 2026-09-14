@@ -19,9 +19,11 @@
 //! `ga4gh:VA.` ids matched byte-for-byte. That check needs the multi-GB reference FASTA,
 //! so it is not part of `cargo test`.
 
+use anyhow::{ensure, Result};
+
 /// Read-only access to a reference sequence, in interbase (0-based, half-open)
 /// coordinates. `len` is the total sequence length; `get(a, b)` returns the residues in
-/// `[a, b)` (uppercased ASCII). Out-of-range requests are clamped by the caller.
+/// `[a, b)` (uppercased ASCII). Callers validate intervals before requesting residues.
 pub trait Reference {
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
@@ -30,18 +32,26 @@ pub trait Reference {
     /// Return residues in interbase `[start, end)`. Callers guarantee `start <= end` and
     /// `end <= len()`.
     fn get(&self, start: usize, end: usize) -> Vec<u8>;
+
+    /// Sequence identity used to verify the seqmap before minting an allele id.
+    /// Large reference providers should cache this value.
+    fn refget_accession(&self) -> String {
+        crate::refget::refget_accession(&self.get(0, self.len()))
+    }
 }
 
 /// An in-memory reference sequence, handy for tests and small contigs.
 pub struct InMemoryReference {
     seq: Vec<u8>,
+    refget: String,
 }
 
 impl InMemoryReference {
     pub fn new(seq: impl Into<Vec<u8>>) -> Self {
         let mut seq = seq.into();
         seq.make_ascii_uppercase();
-        Self { seq }
+        let refget = format!("SQ.{}", crate::digest::sha512t24u(&seq));
+        Self { seq, refget }
     }
 }
 
@@ -52,6 +62,41 @@ impl Reference for InMemoryReference {
     fn get(&self, start: usize, end: usize) -> Vec<u8> {
         self.seq[start.min(self.seq.len())..end.min(self.seq.len())].to_vec()
     }
+
+    fn refget_accession(&self) -> String {
+        self.refget.clone()
+    }
+}
+
+/// Check that the reference belongs to the seqmap and agrees with the input edit.
+pub fn validate_reference(
+    reference: &dyn Reference,
+    start: usize,
+    end: usize,
+    expected_ref: &[u8],
+    expected_accession: &str,
+) -> Result<()> {
+    validate_interval(reference, start, end)?;
+    let accession = reference.refget_accession();
+    ensure!(
+        accession == expected_accession,
+        "reference accession {accession} does not match seqmap accession {expected_accession}"
+    );
+    ensure!(
+        reference.get(start, end).eq_ignore_ascii_case(expected_ref),
+        "REF mismatch at interbase [{start}, {end}): input REF '{}' disagrees with reference FASTA",
+        String::from_utf8_lossy(expected_ref)
+    );
+    Ok(())
+}
+
+fn validate_interval(reference: &dyn Reference, start: usize, end: usize) -> Result<()> {
+    ensure!(
+        start <= end && end <= reference.len(),
+        "interval [{start}, {end}) is outside reference bounds (length {})",
+        reference.len()
+    );
+    Ok(())
 }
 
 /// A set of reference contigs loaded from a FASTA, keyed by contig name. Used at ingest
@@ -117,17 +162,32 @@ pub struct NormalizedAllele {
 
 /// Fully-justified VRS normalization of a REF→ALT edit at interbase `[start, end)`.
 ///
-/// `ref_bases` MUST equal `reference.get(start, end)` (the caller passes the VCF REF; we
-/// re-derive positions from the reference so mismatches are surfaced by callers). The
-/// returned interval/sequence is the canonical, bidirectionally-justified form.
+/// Callers with source REF bases must first call [`validate_reference`]. Invalid
+/// intervals and empty no-op edits return errors. Identity alleles retain their
+/// original span as a ReferenceLengthExpression.
 pub fn normalize(
     reference: &dyn Reference,
     start: usize,
     end: usize,
     alt: &[u8],
-) -> NormalizedAllele {
+) -> Result<NormalizedAllele> {
+    validate_interval(reference, start, end)?;
     let ref_bases = reference.get(start, end);
     let alt = alt.to_ascii_uppercase();
+
+    // Identity alleles have no moving indel unit; do not enter repeat expansion.
+    if ref_bases == alt {
+        ensure!(!alt.is_empty(), "cannot normalize an empty no-op edit");
+        return Ok(NormalizedAllele {
+            start,
+            end,
+            state: NormalizedState::ReferenceLengthExpression {
+                length: alt.len(),
+                repeat_subunit_length: alt.len(),
+            },
+            alt,
+        });
+    }
 
     // 1. Trim common suffix, then common prefix. Track how the interval shrinks.
     let (mut ref_seq, mut alt_seq) = (ref_bases.clone(), alt.clone());
@@ -155,12 +215,12 @@ pub fn normalize(
     //    does not roll these; return the trimmed form as a LiteralSequenceExpression
     //    (vrs-python step 2.b).
     if !ref_seq.is_empty() && !alt_seq.is_empty() {
-        return NormalizedAllele {
+        return Ok(NormalizedAllele {
             start: new_start,
             end: new_end,
             alt: alt_seq,
             state: NormalizedState::Literal,
-        };
+        });
     }
 
     // `seed_length` is the length of the trimmed indel *before* EXPAND rolling — the
@@ -174,7 +234,9 @@ pub fn normalize(
     //    EXPANDing the interval over the full ambiguous region (vrs-python / bioutils
     //    EXPAND mode). The "unit" is the moving sequence — the inserted bases for an
     //    insertion, the deleted reference bases for a deletion.
-    justify_expand(reference, new_start, new_end, &ref_seq, &alt_seq, seed_length)
+    Ok(justify_expand(
+        reference, new_start, new_end, &ref_seq, &alt_seq, seed_length,
+    ))
 }
 
 /// bioutils/vrs-python EXPAND-mode justification. `del` is the (trimmed) deleted
@@ -337,10 +399,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identity_allele_keeps_original_span_without_repeat_expansion() {
+        let r = InMemoryReference::new("CAAAAG");
+        let n = normalize(&r, 2, 4, b"AA").unwrap();
+        assert_eq!((n.start, n.end), (2, 4));
+        assert_eq!(n.alt, b"AA");
+        assert_eq!(
+            n.state,
+            NormalizedState::ReferenceLengthExpression {
+                length: 2,
+                repeat_subunit_length: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_intervals_and_empty_no_ops_return_errors() {
+        let r = InMemoryReference::new("ACGT");
+        for (start, end, alt) in [
+            (3, 2, b"A".as_slice()),
+            (3, 5, b"A"),
+            (5, 5, b"A"),
+            (2, 2, b""),
+        ] {
+            assert!(normalize(&r, start, end, alt).is_err());
+        }
+    }
+
+    #[test]
     fn snv_unchanged() {
         // ref ...A[C]G... , C>T at interbase [3,4)
         let r = InMemoryReference::new("AAACGTT");
-        let n = normalize(&r, 3, 4, b"T");
+        let n = normalize(&r, 3, 4, b"T").unwrap();
         assert_eq!(
             n,
             NormalizedAllele {
@@ -358,7 +448,7 @@ mod tests {
         // reference: C T T A. Trimming yields a 1-base T deletion, then EXPAND covers
         // the whole ambiguous TT run [1,3); alt keeps one T.
         let r = InMemoryReference::new("CTTA");
-        let n = normalize(&r, 0, 3, b"CT");
+        let n = normalize(&r, 0, 3, b"CT").unwrap();
         assert_eq!((n.start, n.end), (1, 3));
         assert_eq!(n.alt, b"T".to_vec()); // one of the two T's remains
         assert_eq!(r.get(n.start, n.end), b"TT");
@@ -373,7 +463,7 @@ mod tests {
     fn deletion_fully_justified_in_homopolymer() {
         // reference: G AAAAA C  (5 A's at [1,6)). Delete one A at [3,4).
         let r = InMemoryReference::new("GAAAAAC");
-        let n = normalize(&r, 3, 4, b"");
+        let n = normalize(&r, 3, 4, b"").unwrap();
         // EXPAND covers the entire A-run; alt holds 4 A's (one deleted).
         assert_eq!((n.start, n.end), (1, 6));
         assert_eq!(n.alt, b"AAAA".to_vec());
@@ -387,7 +477,7 @@ mod tests {
     fn insertion_fully_justified_in_tandem_repeat() {
         // reference: C ATAT G. Insert one "AT" unit at [1,1) into the AT tandem repeat.
         let r = InMemoryReference::new("CATATG");
-        let n = normalize(&r, 1, 1, b"AT");
+        let n = normalize(&r, 1, 1, b"AT").unwrap();
         // EXPAND covers the AT repeat [1,5); alt is three AT units (one inserted).
         assert_eq!((n.start, n.end), (1, 5));
         assert_eq!(n.alt, b"ATATAT".to_vec());
@@ -404,7 +494,7 @@ mod tests {
         // deleted length). vrs-python emits repeatSubunitLength = 4, NOT the period 2.
         let r = InMemoryReference::new("GATATATATATC");
         // Delete "ATAT" at [1,5) (two units).
-        let n = normalize(&r, 1, 5, b"");
+        let n = normalize(&r, 1, 5, b"").unwrap();
         assert_eq!((n.start, n.end), (1, 11)); // whole AT run [1,11)
         assert_eq!(
             n.state,
@@ -417,7 +507,7 @@ mod tests {
         // reference: G (AT)x5 C. Insert two "AT" units inside the run → seed_length = 4,
         // largest valid cycle factor of 4 is 4 → repeatSubunitLength = 4.
         let r = InMemoryReference::new("GATATATATATC");
-        let n = normalize(&r, 3, 3, b"ATAT");
+        let n = normalize(&r, 3, 3, b"ATAT").unwrap();
         assert_eq!((n.start, n.end), (1, 11));
         assert_eq!(
             n.state,
@@ -438,7 +528,7 @@ mod tests {
     fn insertion_rolls_into_flanking_base() {
         let r = InMemoryReference::new("ACGTACGT");
         // Insert "TTT" at [4,4): rolls left one base into the T at index 3.
-        let n = normalize(&r, 4, 4, b"TTT");
+        let n = normalize(&r, 4, 4, b"TTT").unwrap();
         assert_eq!((n.start, n.end), (3, 4));
         assert_eq!(n.alt, b"TTTT".to_vec());
         // Insertion into a 1-base flank: extended_ref="T" (non-empty) so RLE; the largest
@@ -455,7 +545,7 @@ mod tests {
         // Insert "CCC" at [1,1): C at index 1 differs; no left roll (ref[0]='A'),
         // no right roll (ref[1]='C' vs unit[0]='C' → actually matches!). Use a unit that
         // cannot roll at all: insert "GGG" at [4,4) — ref[3]='T', ref[4]='A', no roll.
-        let n = normalize(&r, 4, 4, b"GGG");
+        let n = normalize(&r, 4, 4, b"GGG").unwrap();
         assert_eq!((n.start, n.end), (4, 4));
         assert_eq!(n.alt, b"GGG".to_vec());
         // Pure insertion with empty reference region → LiteralSequenceExpression.

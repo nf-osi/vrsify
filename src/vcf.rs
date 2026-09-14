@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::BufRead;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Context, Result};
 
 use crate::vrs::{Allele, Coordinate, SequenceLocation, SequenceReference, State};
 
@@ -115,17 +115,23 @@ fn allele_from_interval(seq: &SeqInfo, start: i64, end: i64, alt: &str) -> Allel
 /// [`crate::normalize::normalize`] against `reference` so that equivalent indel
 /// representations in repeat regions collapse to one canonical VRS id, matching
 /// vrs-python. Falls back to the naive projection semantics for SNVs (unchanged).
+/// Returns an error if the interval, REF bases, or seqmap accession disagree with
+/// the supplied reference.
 pub fn build_allele_normalized(
     seq: &SeqInfo,
     pos_1based: i64,
     reference: &str,
     alt: &str,
     ref_seq: &dyn crate::normalize::Reference,
-) -> Allele {
+) -> Result<Allele> {
     use crate::normalize::NormalizedState;
-    let start = (pos_1based - 1) as usize;
-    let end = start + reference.len();
-    let n = crate::normalize::normalize(ref_seq, start, end, alt.as_bytes());
+    ensure!(pos_1based >= 1, "POS must be >= 1");
+    let start = usize::try_from(pos_1based - 1).context("POS is too large")?;
+    let end = start
+        .checked_add(reference.len())
+        .context("REF interval overflow")?;
+    crate::normalize::validate_reference(ref_seq, start, end, reference.as_bytes(), &seq.refget)?;
+    let n = crate::normalize::normalize(ref_seq, start, end, alt.as_bytes())?;
     let alt_str = std::str::from_utf8(&n.alt).unwrap_or("").to_string();
     let state = match n.state {
         NormalizedState::Literal => State::LiteralSequenceExpression { sequence: alt_str },
@@ -139,7 +145,7 @@ pub fn build_allele_normalized(
             sequence: (alt_str.len() <= 50).then_some(alt_str),
         },
     };
-    Allele {
+    Ok(Allele {
         location: SequenceLocation {
             sequence_reference: SequenceReference {
                 refget_accession: seq.refget.clone(),
@@ -148,7 +154,7 @@ pub fn build_allele_normalized(
             end: Some(Coordinate::Definite(n.end as i64)),
         },
         state,
-    }
+    })
 }
 
 /// True if an ALT string is a concrete sequence (not symbolic / breakend / missing).

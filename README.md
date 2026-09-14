@@ -75,7 +75,7 @@ Requires a Rust toolchain ([rustup](https://rustup.rs)).
 
 ```sh
 cargo build --release      # binary at ./target/release/vrsify
-cargo test                 # 46 tests, incl. the GA4GH golden-fixture gate
+cargo test                 # includes the GA4GH golden-fixture gate
 ```
 
 ## Quick start
@@ -150,6 +150,14 @@ MAF's rows are indels, but those ids will not join anything unless you pass the 
 The FASTA is currently loaded per-contig into memory; a whole-genome run needs roughly
 3 GB of RAM.
 
+When `--reference` is supplied, both converters require each converted contig to be
+present in the FASTA, verify its sequence digest against the seqmap accession, and
+check that the variant interval is within bounds and its REF bases agree with the
+FASTA (case-insensitively). A mismatch stops conversion with an error; supplying a
+reference never silently falls back to an unnormalized projection. Without
+`--reference`, both VCF and MAF indels carry the `fullyJustified: false` marker and a
+warning.
+
 ## How MAF rows become VRS coordinates
 
 MAF already stores indels trimmed, using `-` placeholders, so the projection into VRS's
@@ -170,6 +178,11 @@ run summary rather than failing the row.
 
 `vrsify` is deliberately loud and drops nothing you didn't ask it to drop.
 
+- **Missing alleles are not deletions.** Missing `Reference_Allele` or
+  `Tumor_Seq_Allele2` values (blank, `.`, or `NA`) stop MAF conversion with a row-specific
+  error. Only an explicit `-` means an empty allele. Reference validation failures
+  also stop conversion. Output files from a failed run may contain earlier rows and
+  must not be treated as complete.
 - **Assembly is part of identity.** A row whose `NCBI_Build` disagrees with the seqmap's
   `assemblyId` never gets a VRS id (handled assemblies are `hg38`/`GRCh38` and `hg19`/`GRCh37`). 
   Real studies do mix builds — one we ingested had 29 GRCh37 rows inside an
@@ -190,7 +203,7 @@ run summary rather than failing the row.
 ## Correctness
 
 VRS ids are worthless unless they are byte-identical to everyone else's. 
-`cargo test` (46 tests) checks:
+`cargo test` checks:
 
 - the `sha512t24u` digest primitive against GA4GH's `functions.yaml` vectors;
 - every `Allele`, `SequenceLocation`, `CopyNumberCount`, `CopyNumberChange`, and
@@ -200,7 +213,9 @@ VRS ids are worthless unless they are byte-identical to everyone else's.
   and an insertion written in MAF's trimmed form and in VCF's anchored form collapse to
   one id;
 - fully-justified normalization (left- and right-shifted representations of one indel
-  must converge) and `seqmap` generation, on synthetic references.
+  must converge) and `seqmap` generation, on synthetic references;
+- missing MAF alleles, reference/seqmap identity and REF mismatches, interval bounds,
+  identity-allele normalization, and warnings/markers for VCF indels without a reference.
 
 Two checks need multi-GB reference files and so are not part of `cargo test`, but were
 run against real data: `vrsify seqmap` over GRCh38 chr19 reproduces GA4GH's canonical
@@ -240,4 +255,3 @@ VEP `CSQ` and snpEff `ANN` INFO annotations, when present, are carried onto each
 observation as `affectedGene` / `affectedGeneSymbol` / `aminoacidChange` /
 `molecularConsequence` (never onto the context-free allele), taking the first
 (most-severe) transcript.
-
