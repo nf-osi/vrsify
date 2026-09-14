@@ -265,3 +265,7 @@ VEP `CSQ` and snpEff `ANN` INFO annotations, when present, are carried onto each
 observation as `affectedGene` / `affectedGeneSymbol` / `aminoacidChange` /
 `molecularConsequence` (never onto the context-free allele), taking the first
 (most-severe) transcript.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

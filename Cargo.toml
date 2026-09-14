@@ -2,6 +2,8 @@
 name = "vrsify"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Assign GA4GH VRS 2.0 identifiers to variants from VCF and cBioPortal MAF files"
 
 [dependencies]
 anyhow = "1.0.103"
