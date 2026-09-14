@@ -1,4 +1,4 @@
-//! Regression coverage for the pre-publication P1 review findings.
+//! Regression coverage for the pre-publication review findings (P1 and P2).
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -196,5 +196,71 @@ fn reference_validation_accepts_case_insensitive_ref_bases() {
         let output = f.run(maf, &row(maf, 4, "a", "t"), Some("ref.fa"), &[]);
         assert!(output.status.success(), "{:?}", output);
         assert_eq!(f.json("alleles.ndjson")[0]["state"]["sequence"], "T");
+    }
+}
+
+/// P2: the seqmap is keyed `chr1`, the source file writes `1`. The MAF path resolved
+/// that alias; the VCF path did an exact lookup and quietly emitted nothing.
+#[test]
+fn contig_aliases_resolve_in_both_formats() {
+    let f = Fixture::new();
+    for maf in [false, true] {
+        for reference in [None, Some("ref.fa")] {
+            let row = if maf {
+                "1\t4\tA\tA\tT\tS1\n".to_string()
+            } else {
+                "1\t4\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n".to_string()
+            };
+            let output = f.run(maf, &row, reference, &[]);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stderr}");
+            assert!(!stderr.contains("missing from seqmap"), "{stderr}");
+            // Same id as the `chr1`-spelled row: the alias is a naming difference, not
+            // a different variant.
+            let alleles = f.json("alleles.ndjson");
+            assert_eq!(alleles.len(), 1, "alias contig produced no allele: {stderr}");
+            assert_eq!(f.json("obs.ndjson")[0]["variant"], alleles[0]["id"]);
+            assert_eq!(alleles[0]["location"]["start"], 3);
+        }
+    }
+}
+
+/// P2: VCF nucleotide strings are case-insensitive, so the state must be uppercased
+/// before hashing — otherwise `A>t` and `A>T` mint two ids for one variant. With a
+/// `--reference` this came free from `normalize`; without one it did not.
+#[test]
+fn lowercase_vcf_alleles_get_the_uppercase_id() {
+    let f = Fixture::new();
+    let rows = row(false, 4, "A", "T") + &row(false, 4, "a", "t");
+    let output = f.run(false, &rows, None, &[]);
+    assert!(output.status.success(), "{:?}", output);
+    let alleles = f.json("alleles.ndjson");
+    assert_eq!(alleles.len(), 1, "case variants must collapse: {alleles:#?}");
+    assert_eq!(alleles[0]["state"]["sequence"], "T");
+    let observations = f.json("obs.ndjson");
+    assert_eq!(observations.len(), 2);
+    for obs in &observations {
+        assert_eq!(obs["variant"], alleles[0]["id"]);
+    }
+    // The observation keeps the row as written; only the VRS state is normalized.
+    assert_eq!(observations[1]["alternateBases"], "t");
+}
+
+/// P2: `GT=1/.` is a diploid call with one uncalled allele — it could be `1/0` or
+/// `1/1`. Counting only the called alleles made it look haploid, i.e. `hemizygous`.
+#[test]
+fn partially_missing_genotype_is_not_hemizygous() {
+    let f = Fixture::new();
+    let gt_row = |gt: &str| format!("chr1\t4\t.\tA\tT\t.\tPASS\t.\tGT\t{gt}\n");
+    for gt in ["1/.", "./1", ".|1", "1|."] {
+        let output = f.run(false, &gt_row(gt), None, &[]);
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(f.json("obs.ndjson")[0]["zygosity"], "unknown", "GT={gt}");
+    }
+    // Genuinely haploid and fully-called genotypes are unaffected.
+    for (gt, zygosity) in [("1", "hemizygous"), ("1/1", "homozygous"), ("0/1", "heterozygous")] {
+        let output = f.run(false, &gt_row(gt), None, &[]);
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(f.json("obs.ndjson")[0]["zygosity"], zygosity, "GT={gt}");
     }
 }

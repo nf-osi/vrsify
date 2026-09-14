@@ -411,7 +411,12 @@ fn rows_without_a_vrs_identity_are_kept_as_unnormalized() {
     )
     .unwrap();
 
-    let (alleles, obs, stderr) = run_maf(&dir, &maf, &seqmap, &[]);
+    let (alleles, obs, stderr) = run_maf(
+        &dir,
+        &maf,
+        &seqmap,
+        &["--study-id", "test_study", "--source", "syn9/odd.maf"],
+    );
     let alleles = json_lines(&alleles);
     assert_eq!(alleles.len(), 2, "both odd rows are kept, got {alleles:#?}");
     for a in &alleles {
@@ -424,9 +429,31 @@ fn rows_without_a_vrs_identity_are_kept_as_unnormalized() {
     assert!(alleles[0]["reason"].as_str().unwrap().contains("seqmap"));
     assert_eq!(alleles[1]["id"], "nf:variant/GRCh37:tinychr:1:C:T");
     assert!(alleles[1]["reason"].as_str().unwrap().contains("GRCh37"));
-    // No observations: nothing got a VRS identity, and the reference-only row is not a variant.
-    assert!(obs.trim().is_empty(), "got observations: {obs}");
-    assert!(stderr.contains("2 unnormalized variant(s) kept"), "{stderr}");
+    // Rejection costs the row its VRS id, not its provenance: each odd row still has an
+    // observation naming the sample/study/source, pointed at the unnormalized node. The
+    // reference-only row is not a variant at all, so it has none.
+    let obs = json_lines(&obs);
+    assert_eq!(obs.len(), 2, "sample provenance must survive rejection: {obs:#?}");
+    for (o, a) in obs.iter().zip(&alleles) {
+        assert_eq!(o["variant"], a["id"]);
+        assert_eq!(o["biosample"], "SAMPLE-A");
+        assert_eq!(o["matchedNormalSampleBarcode"], "SAMPLE-N");
+        assert_eq!(o["studyId"], "test_study");
+        assert_eq!(o["center"], "Sage");
+        assert_eq!(o["sourceFile"], "syn9/odd.maf");
+        assert_eq!(o["tumorAltCount"], 20);
+    }
+    // Unknown contig: no seqmap entry to take `referenceName` from, so the MAF's own
+    // `Chromosome` stands in; the assembly mismatch row keeps the MAF's build.
+    assert_eq!(obs[0]["sourceContig"], "chrZ");
+    assert_eq!(obs[0]["referenceName"], "chrZ");
+    assert_eq!(obs[0]["assemblyId"], "SYN1");
+    assert_eq!(obs[1]["referenceName"], "tinychr");
+    assert_eq!(obs[1]["assemblyId"], "GRCh37");
+    assert!(
+        stderr.contains("2 unnormalized variant(s) kept with 2 observation(s)"),
+        "{stderr}"
+    );
     assert!(stderr.contains("1 rows had no non-reference tumor allele"), "{stderr}");
 
     // --strict turns the same input into a hard failure instead.

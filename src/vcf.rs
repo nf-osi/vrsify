@@ -97,6 +97,10 @@ pub fn build_allele(seq: &SeqInfo, pos_1based: i64, reference: &str, alt: &str) 
 }
 
 fn allele_from_interval(seq: &SeqInfo, start: i64, end: i64, alt: &str) -> Allele {
+    // VCF nucleotide strings are case-insensitive (VCF 4.x sec. 1.6.1: bases may be in
+    // either case), so `A>t` and `A>T` are the same edit and must hash to one id. The
+    // reference-based path gets this from `normalize`, which uppercases internally.
+    let alt = alt.to_ascii_uppercase();
     Allele {
         location: SequenceLocation {
             sequence_reference: SequenceReference {
@@ -105,9 +109,7 @@ fn allele_from_interval(seq: &SeqInfo, start: i64, end: i64, alt: &str) -> Allel
             start: Some(Coordinate::Definite(start)),
             end: Some(Coordinate::Definite(end)),
         },
-        state: State::LiteralSequenceExpression {
-            sequence: alt.to_string(),
-        },
+        state: State::LiteralSequenceExpression { sequence: alt },
     }
 }
 
@@ -343,6 +345,12 @@ impl Observation {
 
 /// Given a sample GT string and the 1-based ALT allele number, return the zygosity if
 /// the sample carries that ALT, else `None`. Handles phased (`|`) and unphased (`/`).
+///
+/// Ploidy comes from the number of GT fields, not from the number of *called* ones: a
+/// partially missing call (`1/.`, VCF 4.x sec. 1.6.2) is a diploid genotype whose second
+/// allele is unknown, so it could be `1/0` or `1/1`. Reporting `hemizygous` there would
+/// assert a single-copy locus (chrX/chrY in a male sample, a haploid `1` call) that the
+/// data does not support, so the uncertainty is kept as `"unknown"`.
 pub fn zygosity_for(gt: &str, alt_number: usize) -> Option<String> {
     let gt = gt.split(':').next().unwrap_or(gt); // GT is the first FORMAT subfield
     if gt == "." || gt.is_empty() {
@@ -356,8 +364,13 @@ pub fn zygosity_for(gt: &str, alt_number: usize) -> Option<String> {
     if carries == 0 {
         return None;
     }
+    let ploidy = alleles.len();
     let called = alleles.iter().flatten().count();
-    Some(match (called, carries) {
+    if called < ploidy {
+        // The sample carries the ALT, but the copy count is not knowable from this GT.
+        return Some("unknown".to_string());
+    }
+    Some(match (ploidy, carries) {
         (1, _) => "hemizygous".to_string(),
         (n, c) if c == n => "homozygous".to_string(),
         _ => "heterozygous".to_string(),
@@ -376,6 +389,13 @@ mod tests {
         assert_eq!(zygosity_for("1", 1).as_deref(), Some("hemizygous"));
         assert_eq!(zygosity_for("1/2", 2).as_deref(), Some("heterozygous"));
         assert_eq!(zygosity_for("./.", 1), None);
+        // Partially missing: diploid with one unknown allele, NOT hemizygous.
+        assert_eq!(zygosity_for("1/.", 1).as_deref(), Some("unknown"));
+        assert_eq!(zygosity_for("./1", 1).as_deref(), Some("unknown"));
+        assert_eq!(zygosity_for(".|1", 1).as_deref(), Some("unknown"));
+        assert_eq!(zygosity_for("1/1/.", 1).as_deref(), Some("unknown"));
+        assert_eq!(zygosity_for("0/.", 1), None);
+        assert_eq!(zygosity_for("1/1/1", 1).as_deref(), Some("homozygous"));
         assert_eq!(zygosity_for("0/1:35,40:75", 1).as_deref(), Some("heterozygous"));
     }
 

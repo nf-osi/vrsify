@@ -114,7 +114,12 @@ vrsify \
 ```
 
 Split multi-allelic sites and left-align upstream (`bcftools norm -m- -f ref.fa`) as
-usual; `vrsify` then applies the VRS-specific normalization on top.
+usual; `vrsify` then applies the VRS-specific normalization on top. Alleles are
+case-insensitive per the VCF spec, so `a>t` and `A>T` get the same id.
+
+`zygosity` is read from `GT`: `homozygous`, `heterozygous`, `hemizygous` (a haploid
+call such as `GT=1`), or `unknown` when part of the genotype is uncalled (`GT=1/.` is
+diploid with one unknown allele, so the copy count is not knowable).
 
 ### 3. Convert a MAF
 
@@ -191,8 +196,11 @@ run summary rather than failing the row.
 - **Nothing is discarded.** Rows that can't be given an identity — unknown contig,
   assembly mismatch, non-nucleotide alleles — are still written to the alleles stream as
   `{"type":"UnnormalizedVariant","unnormalized":true, …,"reason":…}` with a deterministic
-  `{assembly}:{chrom}:{pos}:{ref}:{alt}` key, and counted in the run summary. `--strict`
-  turns them into a hard failure instead.
+  `{assembly}:{chrom}:{pos}:{ref}:{alt}` key, and counted in the run summary. Their
+  observations are written too, referencing that `nf:variant/…` id, so the sample, study
+  and source of a rejected row survive even though its VRS identity does not — two
+  samples carrying the same unknown-contig variant still yield two observations.
+  `--strict` turns them into a hard failure instead.
 - **No silent filtering.** `--min-tumor-alt-count` is **off** by default. It exists
   because real MAFs contain rows with `t_alt_count = 0` — no read in the tumor supports
   the allele (28% of rows in one study we ingested). Recording those as "this specimen

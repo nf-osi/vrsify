@@ -217,7 +217,9 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     for result in reader.records() {
         let record = result.context("reading VCF record")?;
         let chrom = record.reference_sequence_name().to_string();
-        let seq = match seqmap.get(&chrom) {
+        // `chr1` vs `1`: the seqmap may be keyed either way (see `resolve_contig`), and
+        // the resolved key is what the reference FASTA is then looked up by.
+        let (seqmap_key, seq) = match resolve_contig(&seqmap, &chrom) {
             Some(s) => s,
             None => {
                 missing_contigs.insert(chrom);
@@ -254,7 +256,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             let refseq = references
                 .as_ref()
                 .map(|r| {
-                    r.contig(&chrom)
+                    reference_contig(r, &[seqmap_key, chrom.as_str()])
                         .with_context(|| format!("reference FASTA is missing contig '{chrom}'"))
                 })
                 .transpose()?;
@@ -334,8 +336,8 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a MAF contig name in a FASTA, tolerating a `chr`-prefix mismatch the same
-/// way [`resolve_contig`] does for the seqmap.
+/// Resolve a source contig name (MAF `Chromosome` / VCF `CHROM`) in a FASTA, tolerating
+/// a `chr`-prefix mismatch the same way [`resolve_contig`] does for the seqmap.
 fn reference_contig<'a>(
     refs: &'a FastaReferences,
     names: &[&str],
@@ -373,6 +375,7 @@ struct MafCounts {
     assembly_mismatch: u64,
     non_nucleotide: u64,
     unnormalized: u64,
+    unnormalized_observations: u64,
     below_min_alt_count: u64,
     not_fully_justified: u64,
     end_position_warnings: u64,
@@ -492,6 +495,42 @@ fn run_maf(args: MafArgs) -> Result<()> {
             )
         });
 
+        // Which sample, study and file a row came from is row-level provenance that does
+        // not depend on the row earning a VRS id, so the observation is built the same
+        // way for rejected and normalized rows; only `variant_id` differs.
+        let row_no = c.rows;
+        let make_obs = |variant_id: String,
+                        assembly: Option<String>,
+                        reference_name: String|
+         -> Result<MafObservation> {
+            Ok(MafObservation {
+                variant_id,
+                tumor_sample: header
+                    .get(&row, "Tumor_Sample_Barcode")
+                    .with_context(|| format!("MAF row {row_no}: empty Tumor_Sample_Barcode"))?
+                    .to_string(),
+                matched_normal: header
+                    .get(&row, "Matched_Norm_Sample_Barcode")
+                    .map(String::from),
+                contig: contig.clone(),
+                start,
+                end,
+                reference_allele: ref_raw.to_string(),
+                alt_allele: alt_raw.to_string(),
+                assembly,
+                reference_name,
+                source: args.source.clone(),
+                study_id: args.study_id.clone(),
+                center: header.get(&row, "Center").map(String::from),
+                mutation_status: header
+                    .get(&row, "Mutation_Status")
+                    .map(String::from)
+                    .or_else(|| Some(args.mutation_status.clone()).filter(|s| !s.is_empty())),
+                annotation: MafAnnotation::from_row(&header, &row),
+                depth: depth.clone(),
+            })
+        };
+
         if let Some(reason) = reject {
             if args.strict {
                 bail!("MAF row {} ({contig}:{start} {ref_raw}>{alt_raw}): {reason}", c.rows);
@@ -508,6 +547,19 @@ fn run_maf(args: MafArgs) -> Result<()> {
                 writeln!(allele_out, "{}", serde_json::to_string(&u.to_json())?)?;
                 c.unnormalized += 1;
             }
+            // The variant node is deduplicated, the observations are not: every sample
+            // carrying the row still gets a record, pointed at the unnormalized node.
+            let obs = make_obs(
+                u.id(),
+                build.clone().or_else(|| resolved.and_then(|(_, s)| s.assembly.clone())),
+                resolved
+                    .map(|(_, s)| s.reference_name.clone())
+                    .unwrap_or_else(|| contig.clone()),
+            )?;
+            writeln!(obs_out, "{}", serde_json::to_string(&obs.to_json())?)?;
+            // Counted in the total too, so the summary matches the observation file.
+            c.observations += 1;
+            c.unnormalized_observations += 1;
             continue;
         }
 
@@ -552,32 +604,11 @@ fn run_maf(args: MafArgs) -> Result<()> {
             c.alleles += 1;
         }
 
-        let obs = MafObservation {
-            variant_id: vid,
-            tumor_sample: header
-                .get(&row, "Tumor_Sample_Barcode")
-                .with_context(|| format!("MAF row {}: empty Tumor_Sample_Barcode", c.rows))?
-                .to_string(),
-            matched_normal: header
-                .get(&row, "Matched_Norm_Sample_Barcode")
-                .map(String::from),
-            contig,
-            start,
-            end,
-            reference_allele: ref_raw.to_string(),
-            alt_allele: alt_raw.to_string(),
-            assembly: build.or_else(|| seq.assembly.clone()),
-            reference_name: seq.reference_name.clone(),
-            source: args.source.clone(),
-            study_id: args.study_id.clone(),
-            center: header.get(&row, "Center").map(String::from),
-            mutation_status: header
-                .get(&row, "Mutation_Status")
-                .map(String::from)
-                .or_else(|| Some(args.mutation_status.clone()).filter(|s| !s.is_empty())),
-            annotation: MafAnnotation::from_row(&header, &row),
-            depth,
-        };
+        let obs = make_obs(
+            vid,
+            build.or_else(|| seq.assembly.clone()),
+            seq.reference_name.clone(),
+        )?;
         writeln!(obs_out, "{}", serde_json::to_string(&obs.to_json())?)?;
         c.observations += 1;
     }
@@ -600,9 +631,13 @@ fn run_maf(args: MafArgs) -> Result<()> {
     }
     if c.unnormalized > 0 {
         eprintln!(
-            "vrsify maf: {} unnormalized variant(s) kept (unknown contig {}, assembly \
-             mismatch {}, non-nucleotide alleles {})",
-            c.unnormalized, c.unknown_contig, c.assembly_mismatch, c.non_nucleotide
+            "vrsify maf: {} unnormalized variant(s) kept with {} observation(s) (unknown \
+             contig {}, assembly mismatch {}, non-nucleotide alleles {})",
+            c.unnormalized,
+            c.unnormalized_observations,
+            c.unknown_contig,
+            c.assembly_mismatch,
+            c.non_nucleotide
         );
     }
     if !missing_contigs.is_empty() {

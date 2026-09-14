@@ -582,10 +582,16 @@ impl UnnormalizedVariant {
         }
     }
 
+    /// Local (non-VRS) id of the variant node. Observations of a rejected row reference
+    /// this instead of a `ga4gh:VA.` id, so their sample/study provenance is not lost.
+    pub fn id(&self) -> String {
+        format!("nf:variant/{}", self.key)
+    }
+
     pub fn to_json(&self) -> Value {
         let mut m = Map::new();
         m.insert("type".into(), "UnnormalizedVariant".into());
-        m.insert("id".into(), format!("nf:variant/{}", self.key).into());
+        m.insert("id".into(), self.id().into());
         m.insert("unnormalized".into(), true.into());
         m.insert("assemblyId".into(), self.assembly.clone().into());
         m.insert("sourceContig".into(), self.contig.clone().into());
