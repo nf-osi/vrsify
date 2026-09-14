@@ -199,7 +199,9 @@ run summary rather than failing the row.
   `{assembly}:{chrom}:{pos}:{ref}:{alt}` key, and counted in the run summary. Their
   observations are written too, referencing that `nf:variant/…` id, so the sample, study
   and source of a rejected row survive even though its VRS identity does not — two
-  samples carrying the same unknown-contig variant still yield two observations.
+  samples carrying the same unknown-contig variant still yield two observations. The
+  node and observations use the source/CLI assembly when present, otherwise the resolved
+  seqmap assembly, with `unknown` used only when neither can identify it.
   `--strict` turns them into a hard failure instead.
 - **No silent filtering.** `--min-tumor-alt-count` is **off** by default. It exists
   because real MAFs contain rows with `t_alt_count = 0` — no read in the tumor supports

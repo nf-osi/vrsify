@@ -264,3 +264,31 @@ fn partially_missing_genotype_is_not_hemizygous() {
         assert_eq!(f.json("obs.ndjson")[0]["zygosity"], zygosity, "GT={gt}");
     }
 }
+
+/// P2 follow-up: a rejected row used `unknown` in its local variant id when the MAF
+/// omitted NCBI_Build, even though the resolved seqmap supplied an assembly that was
+/// copied onto the observation. The node and observation must derive assembly once.
+#[test]
+fn rejected_variant_and_observation_share_seqmap_assembly() {
+    let f = Fixture::new();
+    std::fs::write(
+        f.0.join("map.tsv"),
+        format!(
+            "chr1\t{}\tSYN1\t1\n",
+            vrsify::refget::refget_accession(SEQUENCE.as_bytes())
+        ),
+    )
+    .unwrap();
+
+    let output = f.run(true, &row(true, 4, "A", "Z"), None, &[]);
+    assert!(output.status.success(), "{:?}", output);
+
+    let alleles = f.json("alleles.ndjson");
+    let observations = f.json("obs.ndjson");
+    assert_eq!(alleles.len(), 1);
+    assert_eq!(observations.len(), 1);
+    assert_eq!(alleles[0]["id"], "nf:variant/SYN1:chr1:4:A:Z");
+    assert_eq!(alleles[0]["assemblyId"], "SYN1");
+    assert_eq!(observations[0]["variant"], alleles[0]["id"]);
+    assert_eq!(observations[0]["assemblyId"], alleles[0]["assemblyId"]);
+}

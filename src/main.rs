@@ -535,8 +535,15 @@ fn run_maf(args: MafArgs) -> Result<()> {
             if args.strict {
                 bail!("MAF row {} ({contig}:{start} {ref_raw}>{alt_raw}): {reason}", c.rows);
             }
+            // Use one assembly value for the local node identity, its metadata, and
+            // every observation that references it. A resolved seqmap supplies the
+            // assembly when the MAF and CLI do not; only an unresolved row is unknown.
+            let unnormalized_assembly = build
+                .clone()
+                .or_else(|| resolved.and_then(|(_, s)| s.assembly.clone()))
+                .unwrap_or_else(|| "unknown".to_string());
             let u = UnnormalizedVariant::new(
-                build.as_deref().unwrap_or("unknown"),
+                &unnormalized_assembly,
                 &contig,
                 start,
                 ref_raw,
@@ -551,7 +558,7 @@ fn run_maf(args: MafArgs) -> Result<()> {
             // carrying the row still gets a record, pointed at the unnormalized node.
             let obs = make_obs(
                 u.id(),
-                build.clone().or_else(|| resolved.and_then(|(_, s)| s.assembly.clone())),
+                Some(unnormalized_assembly),
                 resolved
                     .map(|(_, s)| s.reference_name.clone())
                     .unwrap_or_else(|| contig.clone()),
