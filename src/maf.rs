@@ -72,11 +72,10 @@ impl MafHeader {
         }
         // Canonicalize known spelling variants onto the canonical name.
         for (canonical, variants) in ALIASES {
-            if !idx.contains_key(*canonical) {
-                if let Some(i) = variants.iter().find_map(|v| idx.get(*v)).copied() {
+            if !idx.contains_key(*canonical)
+                && let Some(i) = variants.iter().find_map(|v| idx.get(*v)).copied() {
                     idx.insert(canonical.to_string(), i);
                 }
-            }
         }
         let header = Self { idx };
         let missing: Vec<&str> = REQUIRED

@@ -114,7 +114,7 @@ impl FastaReferences {
     /// Load all contigs from a (plain or bgzipped) FASTA file.
     pub fn from_path<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<Self> {
         use noodles_fasta as fasta;
-        let mut reader = fasta::io::reader::Builder::default().build_from_path(path)?;
+        let mut reader = fasta::io::reader::Builder.build_from_path(path)?;
         let mut contigs = std::collections::HashMap::new();
         for result in reader.records() {
             let record = result?;
@@ -371,7 +371,7 @@ fn factors_desc(n: usize) -> Vec<usize> {
     let mut lower = Vec::new();
     let mut i = 1;
     while i * i <= n {
-        if n % i == 0 {
+        if n.is_multiple_of(i) {
             upper.push(n / i);
             if n / i != i {
                 lower.push(i);

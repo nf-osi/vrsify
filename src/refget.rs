@@ -56,7 +56,7 @@ pub fn seqmap_from_fasta<P: AsRef<Path>>(
     assembly: Option<&str>,
 ) -> Result<Vec<SeqmapRow>> {
     let path = path.as_ref();
-    let mut reader = fasta::io::reader::Builder::default()
+    let mut reader = fasta::io::reader::Builder
         .build_from_path(path)
         .with_context(|| format!("opening reference FASTA {path:?}"))?;
 

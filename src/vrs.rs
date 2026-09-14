@@ -114,11 +114,9 @@ impl State {
         if let State::ReferenceLengthExpression {
             sequence: Some(s), ..
         } = self
-        {
-            if let Value::Object(m) = &mut v {
+            && let Value::Object(m) = &mut v {
                 m.insert("sequence".into(), Value::from(s.clone()));
             }
-        }
         v
     }
 }

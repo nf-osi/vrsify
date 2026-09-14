@@ -255,16 +255,14 @@ pub fn parse_info(info: &str) -> HashMap<&str, &str> {
 /// snpEff `ANN` has a fixed column order (Sequence Ontology `ANN` spec).
 pub fn extract_annotation(info: &str, csq_format: Option<&[String]>) -> Annotation {
     let map = parse_info(info);
-    if let Some(csq) = map.get("CSQ").or_else(|| map.get("vep")) {
-        if let Some(first) = csq.split(',').next() {
+    if let Some(csq) = map.get("CSQ").or_else(|| map.get("vep"))
+        && let Some(first) = csq.split(',').next() {
             return parse_vep_csq(first, csq_format);
         }
-    }
-    if let Some(ann) = map.get("ANN") {
-        if let Some(first) = ann.split(',').next() {
+    if let Some(ann) = map.get("ANN")
+        && let Some(first) = ann.split(',').next() {
             return parse_snpeff_ann(first);
         }
-    }
     Annotation::default()
 }
 
@@ -386,7 +384,7 @@ pub fn zygosity_for(gt: &str, alt_number: usize) -> Option<String> {
         return None;
     }
     let alleles: Vec<Option<usize>> = gt
-        .split(|c| c == '/' || c == '|')
+        .split(['/', '|'])
         .map(|a| a.parse::<usize>().ok())
         .collect();
     let carries = alleles.iter().flatten().filter(|&&a| a == alt_number).count();
