@@ -296,22 +296,123 @@ fn padded_substitutions_reach_the_canonical_id_without_a_reference() {
 /// P2: the VCF path minted `ga4gh:VA.` ids for non-ACGTN REF/ALT strings (IUPAC codes,
 /// caller junk) that the MAF path routes away from VRS identity. Both front ends must
 /// enforce the same policy: no id, loud count, and the rest of the file still converts.
+///
+/// P3: and — again matching the MAF path — the rejected records are *kept* as
+/// `UnnormalizedVariant` nodes with their observations, not dropped.
 #[test]
-fn non_nucleotide_vcf_alleles_are_skipped_not_minted() {
+fn non_nucleotide_vcf_alleles_are_kept_unnormalized_not_minted() {
     let f = Fixture::new();
     let rows = row(false, 4, "A", "Z") + &row(false, 5, "A", "R") + &row(false, 4, "A", "T");
     for reference in [None, Some("ref.fa")] {
         let output = f.run(false, &rows, reference, &[]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stderr}");
-        assert!(
-            stderr.contains("2 variant-allele(s) with non-ACGTN REF/ALT skipped"),
-            "{stderr}"
-        );
+        assert!(stderr.contains("non-nucleotide alleles 2"), "{stderr}");
+
         let alleles = f.json("alleles.ndjson");
-        assert_eq!(alleles.len(), 1, "only the valid row mints an id: {alleles:#?}");
-        assert_eq!(alleles[0]["state"]["sequence"], "T");
-        assert_eq!(f.json("obs.ndjson").len(), 1);
+        let observations = f.json("obs.ndjson");
+        assert_eq!(alleles.len(), 3, "{alleles:#?}");
+        assert_eq!(observations.len(), 3);
+        // The two junk rows keep their provenance under a local, non-VRS id.
+        for (allele, alt) in alleles[..2].iter().zip(["Z", "R"]) {
+            assert_eq!(allele["type"], "UnnormalizedVariant");
+            assert_eq!(allele["unnormalized"], true);
+            assert_eq!(allele["alternateBases"], alt);
+            assert!(
+                allele["reason"].as_str().unwrap().contains("non-nucleotide"),
+                "{allele:#?}"
+            );
+            assert!(allele["id"].as_str().unwrap().starts_with("nf:variant/"));
+        }
+        for (allele, obs) in alleles.iter().zip(&observations) {
+            assert_eq!(obs["variant"], allele["id"]);
+        }
+        // ...and only the valid row mints a VRS id.
+        assert_eq!(alleles[2]["state"]["sequence"], "T");
+        assert!(alleles[2]["id"].as_str().unwrap().starts_with("ga4gh:VA."));
+    }
+}
+
+/// P3: a VCF record on a contig the seqmap does not know was dropped with only a
+/// summary warning, so the samples carrying it vanished from the output — while the
+/// same row in a MAF was kept as an `UnnormalizedVariant`. "Nothing is discarded" has
+/// to mean the same thing in both front ends.
+#[test]
+fn unknown_vcf_contigs_are_kept_unnormalized_with_their_observations() {
+    let f = Fixture::new();
+    let rows = "chrZ\t4\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n".to_string()
+        + "chrZ\t4\t.\tA\tT\t.\tPASS\t.\tGT\t1/1\n"
+        + &row(false, 4, "A", "T");
+    let output = f.run(false, &rows, None, &["--assembly", "GRCh38"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("1 unnormalized variant(s) kept with 2 observation(s)"), "{stderr}");
+    assert!(stderr.contains("contigs missing from seqmap (kept as unnormalized): chrZ"), "{stderr}");
+
+    let alleles = f.json("alleles.ndjson");
+    let observations = f.json("obs.ndjson");
+    // The two chrZ records are one variant node...
+    assert_eq!(alleles.len(), 2, "{alleles:#?}");
+    assert_eq!(alleles[0]["id"], "nf:variant/GRCh38:chrZ:4:A:T");
+    assert_eq!(alleles[0]["assemblyId"], "GRCh38");
+    assert_eq!(alleles[0]["reason"], "contig is not in the seqmap");
+    // ...but each sample carrying it is still its own observation.
+    assert_eq!(observations.len(), 3);
+    assert_eq!(observations[0]["variant"], alleles[0]["id"]);
+    assert_eq!(observations[0]["zygosity"], "heterozygous");
+    assert_eq!(observations[1]["variant"], alleles[0]["id"]);
+    assert_eq!(observations[1]["zygosity"], "homozygous");
+    assert_eq!(observations[1]["assemblyId"], "GRCh38");
+    // The known-contig record is unaffected.
+    assert!(alleles[1]["id"].as_str().unwrap().starts_with("ga4gh:VA."));
+    assert_eq!(observations[2]["variant"], alleles[1]["id"]);
+}
+
+/// P3: `--strict` on the VCF path, mirroring the MAF one — refuse to write an
+/// unnormalized record at all.
+#[test]
+fn vcf_strict_fails_on_records_that_cannot_be_given_an_identity() {
+    let f = Fixture::new();
+    for (rows, message) in [
+        ("chrZ\t4\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n", "contig is not in the seqmap"),
+        (&row(false, 4, "A", "Z"), "non-nucleotide allele"),
+    ] {
+        let output = f.run(false, rows, None, &["--strict"]);
+        f.assert_rejected(output, message);
+    }
+    // A convertible file is untouched by --strict.
+    let output = f.run(false, &row(false, 4, "A", "T"), None, &["--strict"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(f.json("alleles.ndjson").len(), 1);
+}
+
+/// P3: symbolic/structural ALTs stay an explicit scope exclusion rather than becoming
+/// `{ref}:{alt}`-keyed nodes that silently drop the `END`/`SVLEN` defining them — but
+/// they are counted, and the rest of the record set still converts.
+#[test]
+fn symbolic_alts_are_counted_and_do_not_block_the_record() {
+    let f = Fixture::new();
+    let rows = "chr1\t4\t.\tA\t<DEL>\t.\tPASS\t.\tGT\t0/1\n".to_string()
+        + "chr1\t4\t.\tA\tT,*\t.\tPASS\t.\tGT\t1/2\n";
+    let output = f.run(false, &rows, None, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("2 non-concrete ALTs skipped"), "{stderr}");
+    let alleles = f.json("alleles.ndjson");
+    assert_eq!(alleles.len(), 1, "{alleles:#?}");
+    assert_eq!(alleles[0]["state"]["sequence"], "T");
+}
+
+/// P3: the VCF and MAF observation streams described the same relationship with two
+/// different `type` values (`VariantCall` vs `VariantObservation`), so a consumer
+/// needed a per-format loader for it.
+#[test]
+fn both_front_ends_emit_the_same_observation_type() {
+    let f = Fixture::new();
+    for maf in [false, true] {
+        let output = f.run(maf, &row(maf, 4, "A", "T"), None, &[]);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(f.json("obs.ndjson")[0]["type"], "VariantObservation", "maf={maf}");
     }
 }
 
@@ -332,6 +433,48 @@ fn identity_alleles_agree_across_naive_and_normalized_paths() {
         ids.push(alleles[0]["id"].clone());
     }
     assert_eq!(ids[0], ids[1]);
+}
+
+/// P3: only `GRCh38.p13` was aliased, so a `GRCh37.p13` row (and patch suffixes
+/// generally) read as an assembly mismatch and lost its VRS id. A patch release does
+/// not move primary-assembly coordinates, so it must match its base assembly.
+#[test]
+fn patched_assembly_builds_are_not_a_mismatch() {
+    let f = Fixture::new();
+    for (seqmap_build, maf_build) in [("GRCh37", "GRCh37.p13"), ("GRCh38", "GRCh38.p13")] {
+        std::fs::write(
+            f.0.join("map.tsv"),
+            format!(
+                "chr1\t{}\t{seqmap_build}\t1\n",
+                vrsify::refget::refget_accession(SEQUENCE.as_bytes())
+            ),
+        )
+        .unwrap();
+        let maf_row = format!("chr1\t4\tA\tA\tT\tS1\t{maf_build}\n");
+        let rows = format!("{}\tNCBI_Build\n{maf_row}", MAF_HEADER.trim_end_matches('\n'));
+        // Header gains an NCBI_Build column, so write the file directly.
+        std::fs::write(f.0.join("input.maf"), rows).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_vrsify"))
+            .args(["maf", "--maf"])
+            .arg(f.0.join("input.maf"))
+            .arg("--seqmap")
+            .arg(f.0.join("map.tsv"))
+            .arg("--out-alleles")
+            .arg(f.0.join("alleles.ndjson"))
+            .arg("--out-observations")
+            .arg(f.0.join("obs.ndjson"))
+            .arg("--strict")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{maf_build} vs {seqmap_build}: {stderr}");
+        let alleles = f.json("alleles.ndjson");
+        assert_eq!(alleles.len(), 1);
+        assert!(
+            alleles[0]["id"].as_str().unwrap().starts_with("ga4gh:VA."),
+            "patched build must still earn a VRS id: {alleles:#?}"
+        );
+    }
 }
 
 /// P2 follow-up: a rejected row used `unknown` in its local variant id when the MAF

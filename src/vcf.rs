@@ -11,8 +11,12 @@
 //!     including padded ones like `GT>GA` — are exact; pure indels still need the
 //!     reference-based "fully justified" normalization (in `normalize.rs`), applied when
 //!     a reference FASTA is supplied. Run `bcftools norm -m- -f REF` upstream as usual.
-//!   * Symbolic/structural ALTs (`<DEL>`, breakends) and non-ACGTN REF/ALT strings are
-//!     skipped and counted (the latter in `main.rs`, mirroring the MAF front end).
+//!   * Symbolic/structural ALTs (`<DEL>`, breakends, `*`) are an explicit scope
+//!     exclusion: they are counted and skipped, because their meaning lives in
+//!     `INFO/END`/`SVLEN` rather than in the REF/ALT strings this module projects.
+//!   * Non-ACGTN REF/ALT strings and contigs absent from the seqmap get no VRS id, but
+//!     are *kept* as [`crate::unnormalized::UnnormalizedVariant`] nodes with their
+//!     observations (in `main.rs`, mirroring the MAF front end).
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -245,25 +249,154 @@ pub fn parse_info(info: &str) -> HashMap<&str, &str> {
     m
 }
 
-/// Extract a gene/consequence annotation from a raw INFO string, trying VEP `CSQ`
-/// first, then snpEff `ANN`. Only the first (most-severe, per convention) transcript
-/// annotation is used. Returns an empty `Annotation` when neither field is present.
+/// Extract a gene/consequence annotation for **one ALT allele** from a raw INFO string,
+/// trying VEP `CSQ` first, then snpEff `ANN`. Returns an empty `Annotation` when neither
+/// field is present.
+///
+/// `reference`/`alt` are the record's REF and the single ALT being observed, and
+/// `alt_number` is that ALT's 1-based index in the record. A `CSQ`/`ANN` value holds one
+/// entry per (allele, transcript) pair, so on a multiallelic record — or on a record
+/// split by `bcftools norm -m-`, which leaves the *whole* original `CSQ` on every split
+/// line — blindly taking the first entry can describe a different ALT than the one being
+/// observed. Entries are therefore filtered to this ALT first (see
+/// [`csq_entries_for_alt`]); the first survivor is used, which is VEP's most-severe
+/// ordering. When no entry can be attributed to this ALT the whole list is used, so a
+/// layout without an allele column degrades to the previous behaviour instead of
+/// dropping the annotation.
 ///
 /// VEP `CSQ` format string lives in the header `##INFO=<ID=CSQ,...Format: A|B|C>`; when
 /// `csq_format` is supplied we key columns by name (`Consequence`, `SYMBOL`, `Gene`,
 /// `HGVSp`/`Amino_acids`). Without it we fall back to VEP's default column order.
 /// snpEff `ANN` has a fixed column order (Sequence Ontology `ANN` spec).
-pub fn extract_annotation(info: &str, csq_format: Option<&[String]>) -> Annotation {
+pub fn extract_annotation(
+    info: &str,
+    csq_format: Option<&[String]>,
+    reference: &str,
+    alt: &str,
+    alt_number: usize,
+) -> Annotation {
     let map = parse_info(info);
-    if let Some(csq) = map.get("CSQ").or_else(|| map.get("vep"))
-        && let Some(first) = csq.split(',').next() {
+    if let Some(csq) = map.get("CSQ").or_else(|| map.get("vep")) {
+        let allele_col = match csq_format {
+            Some(fmt) => fmt.iter().position(|f| f == "Allele"),
+            None => VEP_DEFAULT_FIELDS.iter().position(|f| *f == "Allele"),
+        };
+        let allele_num_col = csq_format.and_then(|f| f.iter().position(|c| c == "ALLELE_NUM"));
+        let entries =
+            csq_entries_for_alt(csq, allele_col, allele_num_col, reference, alt, alt_number);
+        if let Some(first) = entries.first() {
             return parse_vep_csq(first, csq_format);
         }
-    if let Some(ann) = map.get("ANN")
-        && let Some(first) = ann.split(',').next() {
+    }
+    if let Some(ann) = map.get("ANN") {
+        // snpEff's ANN layout is fixed: column 0 is the allele, and there is no
+        // ALLELE_NUM equivalent.
+        let entries = csq_entries_for_alt(ann, Some(0), None, reference, alt, alt_number);
+        if let Some(first) = entries.first() {
             return parse_snpeff_ann(first);
         }
+    }
     Annotation::default()
+}
+
+/// The `CSQ`/`ANN` entries that describe `alt`, in source order.
+///
+/// Matching prefers an explicit `ALLELE_NUM` column (VEP `--allele_number`, the only
+/// unambiguous signal) and otherwise compares the entry's allele column against the
+/// spellings a tool may use for this ALT (see [`vep_allele_spellings`]). If nothing
+/// matches — no allele column, an unrecognized spelling — every entry is returned, so
+/// the caller falls back to the first-entry convention rather than losing the annotation.
+fn csq_entries_for_alt<'a>(
+    value: &'a str,
+    allele_col: Option<usize>,
+    allele_num_col: Option<usize>,
+    reference: &str,
+    alt: &str,
+    alt_number: usize,
+) -> Vec<&'a str> {
+    let all: Vec<&str> = value.split(',').filter(|e| !e.is_empty()).collect();
+    let field = |entry: &'a str, col: usize| entry.split('|').nth(col).map(str::trim);
+
+    if let Some(col) = allele_num_col {
+        let matched: Vec<&str> = all
+            .iter()
+            .copied()
+            .filter(|e| field(e, col) == Some(alt_number.to_string().as_str()))
+            .collect();
+        if !matched.is_empty() {
+            return matched;
+        }
+    }
+    if let Some(col) = allele_col {
+        let spellings = vep_allele_spellings(reference, alt);
+        let matched: Vec<&str> = all
+            .iter()
+            .copied()
+            .filter(|e| {
+                field(e, col)
+                    .is_some_and(|a| spellings.iter().any(|s| a.eq_ignore_ascii_case(s)))
+            })
+            .collect();
+        if !matched.is_empty() {
+            return matched;
+        }
+    }
+    all
+}
+
+/// The spellings a VEP/snpEff `Allele` column may use for one VCF REF/ALT pair.
+///
+/// snpEff writes the ALT verbatim. VEP writes the *minimal* allele: for an indel it
+/// strips the bases REF and ALT share on the left and writes `-` when nothing is left,
+/// so a VCF `CTT>CT` deletion is reported as `T` — sometimes as `-`, depending on how
+/// much padding the caller used. All of these are accepted.
+fn vep_allele_spellings(reference: &str, alt: &str) -> Vec<String> {
+    let mut out = vec![alt.to_string()];
+    if reference.len() != alt.len() {
+        // VEP trims the shared left flank only.
+        let pfx = reference
+            .bytes()
+            .zip(alt.bytes())
+            .take_while(|(r, a)| r.eq_ignore_ascii_case(a))
+            .count();
+        let trimmed = &alt[pfx..];
+        out.push(if trimmed.is_empty() { "-".to_string() } else { trimmed.to_string() });
+        // Some writers trim both flanks (`bcftools`-style minimal representation).
+        let (pfx, sfx) = crate::normalize::trim_common(reference.as_bytes(), alt.as_bytes());
+        let trimmed = &alt[pfx..alt.len() - sfx];
+        out.push(if trimmed.is_empty() { "-".to_string() } else { trimmed.to_string() });
+    }
+    out
+}
+
+/// Decode the percent-escapes VCF 4.3 (sec. 1.2) requires in INFO values, which VEP uses
+/// for characters that would otherwise break the field: `%3D` for `=` (an HGVSp
+/// synonymous change is written `p.Cys130%3D`), `%2C` for `,`, `%3B` for `;`, `%25` for
+/// `%`. Decoding happens *after* the value is split on `,` and `|`, so an escaped
+/// delimiter cannot be mistaken for a real one. Malformed escapes are left as written.
+fn percent_decode(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Default VEP CSQ column order (the common subset), used when the header Format string
@@ -291,7 +424,7 @@ fn parse_vep_csq(entry: &str, csq_format: Option<&[String]>) -> Annotation {
         cols.get(idx)
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .map(String::from)
+            .map(percent_decode)
     };
     let aa = col("HGVSp").or_else(|| col("Amino_acids"));
     Annotation {
@@ -311,7 +444,7 @@ fn parse_snpeff_ann(entry: &str) -> Annotation {
         c.get(i)
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .map(String::from)
+            .map(percent_decode)
     };
     Annotation {
         consequence: get(1),
@@ -340,7 +473,11 @@ pub struct Observation {
 impl Observation {
     pub fn to_json(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
-        m.insert("type".into(), "VariantCall".into());
+        // Both front ends emit `VariantObservation` (issue #95's class for "sample S
+        // carries variant V"). It used to be Beacon's `VariantCall` here and
+        // `VariantObservation` on the MAF path, which made the two streams need
+        // different loaders for the same relationship.
+        m.insert("type".into(), "VariantObservation".into());
         m.insert("variant".into(), self.variant_id.clone().into());
         m.insert("biosample".into(), self.sample.clone().into());
         m.insert("zygosity".into(), self.zygosity.clone().into());
@@ -434,7 +571,7 @@ mod tests {
             .map(String::from)
             .collect();
         let info = "AC=1;CSQ=T|missense_variant|MODERATE|APOE|ENSG00000130203|ENSP00000252486.3:p.Cys130Arg";
-        let ann = extract_annotation(info, Some(&fmt));
+        let ann = extract_annotation(info, Some(&fmt), "C", "T", 1);
         assert_eq!(ann.gene_symbol.as_deref(), Some("APOE"));
         assert_eq!(ann.gene_id.as_deref(), Some("ENSG00000130203"));
         assert_eq!(ann.consequence.as_deref(), Some("missense_variant"));
@@ -448,7 +585,7 @@ mod tests {
     fn vep_csq_default_order() {
         // No header format supplied → fall back to VEP default column order.
         let info = "CSQ=A|stop_gained|HIGH|BRCA1|ENSG00000012048|Transcript|ENST0|protein_coding|c.1|p.Arg100Ter";
-        let ann = extract_annotation(info, None);
+        let ann = extract_annotation(info, None, "C", "A", 1);
         assert_eq!(ann.gene_symbol.as_deref(), Some("BRCA1"));
         assert_eq!(ann.gene_id.as_deref(), Some("ENSG00000012048"));
         assert_eq!(ann.consequence.as_deref(), Some("stop_gained"));
@@ -458,7 +595,7 @@ mod tests {
     #[test]
     fn snpeff_ann() {
         let info = "ANN=T|missense_variant|MODERATE|TP53|ENSG00000141510|transcript|ENST1|protein_coding|5/11|c.215C>G|p.Pro72Arg|215/1182|215/1182|72/393||";
-        let ann = extract_annotation(info, None);
+        let ann = extract_annotation(info, None, "C", "T", 1);
         assert_eq!(ann.gene_symbol.as_deref(), Some("TP53"));
         assert_eq!(ann.gene_id.as_deref(), Some("ENSG00000141510"));
         assert_eq!(ann.consequence.as_deref(), Some("missense_variant"));
@@ -467,8 +604,112 @@ mod tests {
 
     #[test]
     fn no_annotation() {
-        assert!(extract_annotation("AC=1;DP=30", None).is_empty());
-        assert!(extract_annotation(".", None).is_empty());
+        assert!(extract_annotation("AC=1;DP=30", None, "C", "T", 1).is_empty());
+        assert!(extract_annotation(".", None, "C", "T", 1).is_empty());
+    }
+
+    /// A multiallelic record carries one CSQ entry per (allele, transcript). Taking the
+    /// first entry unconditionally annotated ALT 2 with ALT 1's gene/consequence.
+    #[test]
+    fn csq_entry_is_matched_to_the_alt_being_observed() {
+        let fmt: Vec<String> = "Allele|Consequence|IMPACT|SYMBOL|Gene|HGVSp"
+            .split('|')
+            .map(String::from)
+            .collect();
+        let info = "CSQ=T|missense_variant|MODERATE|APOE|ENSG1|p.Cys130Arg,\
+                    G|stop_gained|HIGH|APOE|ENSG1|p.Cys130Ter";
+        let info = &info.replace(' ', "");
+        for (alt, consequence, aa) in [
+            ("T", "missense_variant", "p.Cys130Arg"),
+            ("G", "stop_gained", "p.Cys130Ter"),
+        ] {
+            let ann = extract_annotation(info, Some(&fmt), "C", alt, 1);
+            assert_eq!(ann.consequence.as_deref(), Some(consequence), "ALT={alt}");
+            assert_eq!(ann.aminoacid_change.as_deref(), Some(aa), "ALT={alt}");
+        }
+    }
+
+    /// `bcftools norm -m-` splits a multiallelic record but leaves the *whole* original
+    /// CSQ on every split line, so the allele column is the only way to tell them apart.
+    /// The several transcript entries for the matching allele stay in VEP's most-severe
+    /// order, so the first survivor is still the one to use.
+    #[test]
+    fn csq_keeps_most_severe_entry_among_the_matching_allele() {
+        let fmt: Vec<String> = "Allele|Consequence|IMPACT|SYMBOL|Gene"
+            .split('|')
+            .map(String::from)
+            .collect();
+        let info = "CSQ=T|missense_variant|MODERATE|APOE|ENSG1,\
+                    T|intron_variant|MODIFIER|APOE|ENSG1,\
+                    G|stop_gained|HIGH|OTHER|ENSG2";
+        let info = &info.replace(' ', "");
+        let ann = extract_annotation(info, Some(&fmt), "C", "T", 1);
+        assert_eq!(ann.consequence.as_deref(), Some("missense_variant"));
+        assert_eq!(ann.gene_symbol.as_deref(), Some("APOE"));
+    }
+
+    /// VEP's `ALLELE_NUM` names the ALT index outright; it wins over spelling matching.
+    #[test]
+    fn csq_prefers_allele_num_when_present() {
+        let fmt: Vec<String> = "Allele|Consequence|SYMBOL|ALLELE_NUM"
+            .split('|')
+            .map(String::from)
+            .collect();
+        let info = "CSQ=T|missense_variant|APOE|1,T|stop_gained|OTHER|2";
+        assert_eq!(
+            extract_annotation(info, Some(&fmt), "C", "T", 2).gene_symbol.as_deref(),
+            Some("OTHER")
+        );
+    }
+
+    /// VEP reports the *minimal* allele, so a VCF-padded indel never matches the ALT
+    /// verbatim: `CTT>CT` is `T` (or `-`) in the CSQ. Both spellings must resolve.
+    #[test]
+    fn csq_matches_veps_minimal_indel_allele() {
+        let fmt: Vec<String> = "Allele|Consequence|SYMBOL".split('|').map(String::from).collect();
+        for allele in ["T", "-"] {
+            let info = format!("CSQ={allele}|frameshift_variant|NF1");
+            let ann = extract_annotation(&info, Some(&fmt), "CTT", "CT", 1);
+            assert_eq!(ann.gene_symbol.as_deref(), Some("NF1"), "CSQ Allele={allele}");
+        }
+    }
+
+    /// With no attributable entry (a layout with no allele column, an unrecognized
+    /// spelling) the annotation must degrade to the first entry, not vanish.
+    #[test]
+    fn csq_falls_back_to_the_first_entry_when_nothing_matches() {
+        let fmt: Vec<String> = "Consequence|SYMBOL".split('|').map(String::from).collect();
+        let info = "CSQ=missense_variant|APOE";
+        assert_eq!(
+            extract_annotation(info, Some(&fmt), "C", "T", 1).gene_symbol.as_deref(),
+            Some("APOE")
+        );
+        // Allele column present but spelled in a way we do not recognize.
+        let fmt: Vec<String> = "Allele|Consequence|SYMBOL".split('|').map(String::from).collect();
+        let info = "CSQ=C/T|missense_variant|APOE";
+        assert_eq!(
+            extract_annotation(info, Some(&fmt), "C", "T", 1).gene_symbol.as_deref(),
+            Some("APOE")
+        );
+    }
+
+    /// VCF 4.3 percent-encodes characters that would break an INFO value; VEP writes a
+    /// synonymous HGVSp as `p.Cys130%3D`, which must not reach consumers escaped.
+    #[test]
+    fn csq_fields_are_percent_decoded() {
+        let fmt: Vec<String> = "Allele|Consequence|SYMBOL|HGVSp"
+            .split('|')
+            .map(String::from)
+            .collect();
+        let info = "CSQ=T|synonymous_variant|APOE|ENSP1:p.Cys130%3D";
+        let ann = extract_annotation(info, Some(&fmt), "C", "T", 1);
+        assert_eq!(ann.aminoacid_change.as_deref(), Some("ENSP1:p.Cys130="));
+        assert_eq!(percent_decode("a%2Cb%3Bc%25d"), "a,b;c%d");
+        // Malformed or truncated escapes are left exactly as written.
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%ZZ"), "%ZZ");
+        assert_eq!(percent_decode("%3"), "%3");
+        assert_eq!(percent_decode("plain"), "plain");
     }
 
     #[test]

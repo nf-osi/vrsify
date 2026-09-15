@@ -215,11 +215,30 @@ pub fn build_matches(a: &str, b: &str) -> bool {
 
 fn canonical_build(build: &str) -> String {
     let b = build.trim().to_ascii_lowercase();
-    match b.as_str() {
-        "hg38" | "grch38" | "grch38.p13" | "38" => "grch38".to_string(),
+    let b = strip_patch_suffix(&b);
+    match b {
+        "hg38" | "grch38" | "38" => "grch38".to_string(),
         "hg19" | "grch37" | "37" => "grch37".to_string(),
         "hg18" | "ncbi36" | "36" => "ncbi36".to_string(),
-        _ => b,
+        _ => b.to_string(),
+    }
+}
+
+/// Drop a GRC patch-release suffix (`GRCh37.p13` → `GRCh37`).
+///
+/// A patch release adds fix/novel scaffolds; the coordinates of the primary assembly
+/// are unchanged by construction, which is why a refget accession derived from a
+/// `GRCh38.p13` FASTA is the accession for plain `GRCh38` chromosomes. Callers spell the
+/// build either way — GDC MAFs write `GRCh38`, some pipelines write `GRCh38.p13` — so
+/// the suffix must be dropped before matching, or the whole patched-build class reads as
+/// an assembly mismatch and loses its VRS identity.
+fn strip_patch_suffix(build: &str) -> &str {
+    let Some((base, suffix)) = build.rsplit_once('.') else {
+        return build;
+    };
+    match suffix.strip_prefix('p') {
+        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => build,
     }
 }
 
@@ -472,9 +491,8 @@ pub struct MafObservation {
 impl MafObservation {
     pub fn to_json(&self) -> Value {
         let mut m = Map::new();
-        // NOTE: issue #95 models this class as `nf:VariantObservation`. The VCF path
-        // still emits `VariantCall` (Beacon's vocabulary); unify before the RDF
-        // projection lands.
+        // Issue #95's class for "sample S carries variant V"; the VCF path emits the
+        // same `type`, so one loader handles both streams.
         m.insert("type".into(), "VariantObservation".into());
         m.insert("variant".into(), self.variant_id.clone().into());
         m.insert("biosample".into(), self.tumor_sample.clone().into());
@@ -571,62 +589,6 @@ impl MafObservation {
         if let Some(vaf) = d.vaf() {
             m.insert("variantAlleleFrequency".into(), vaf.into());
         }
-        Value::Object(m)
-    }
-}
-
-/// A row that could not be given a VRS identity (unknown contig, assembly mismatch, or
-/// non-ACGTN alleles). Per issue #95 these are **kept**, not dropped: a deterministic
-/// local key from `{assembly}:{chrom}:{pos}:{ref}:{alt}` collapses duplicates across
-/// studies, and the `unnormalized` flag lets the KG mark them `nf:unnormalizedVariant`.
-#[derive(Debug, Clone)]
-pub struct UnnormalizedVariant {
-    pub key: String,
-    pub assembly: String,
-    pub contig: String,
-    pub start: i64,
-    pub reference_allele: String,
-    pub alt_allele: String,
-    pub reason: String,
-}
-
-impl UnnormalizedVariant {
-    pub fn new(
-        assembly: &str,
-        contig: &str,
-        start: i64,
-        reference_allele: &str,
-        alt_allele: &str,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            key: format!("{assembly}:{contig}:{start}:{reference_allele}:{alt_allele}"),
-            assembly: assembly.to_string(),
-            contig: contig.to_string(),
-            start,
-            reference_allele: reference_allele.to_string(),
-            alt_allele: alt_allele.to_string(),
-            reason: reason.into(),
-        }
-    }
-
-    /// Local (non-VRS) id of the variant node. Observations of a rejected row reference
-    /// this instead of a `ga4gh:VA.` id, so their sample/study provenance is not lost.
-    pub fn id(&self) -> String {
-        format!("nf:variant/{}", self.key)
-    }
-
-    pub fn to_json(&self) -> Value {
-        let mut m = Map::new();
-        m.insert("type".into(), "UnnormalizedVariant".into());
-        m.insert("id".into(), self.id().into());
-        m.insert("unnormalized".into(), true.into());
-        m.insert("assemblyId".into(), self.assembly.clone().into());
-        m.insert("sourceContig".into(), self.contig.clone().into());
-        m.insert("sourcePos".into(), self.start.into());
-        m.insert("referenceBases".into(), self.reference_allele.clone().into());
-        m.insert("alternateBases".into(), self.alt_allele.clone().into());
-        m.insert("reason".into(), self.reason.clone().into());
         Value::Object(m)
     }
 }
@@ -738,6 +700,30 @@ mod tests {
     }
 
     #[test]
+    fn patch_releases_match_their_base_assembly() {
+        // A patch release leaves primary-assembly coordinates alone, so `GRCh37.p13`
+        // rows must not be rejected as a mismatch against a `GRCh37` seqmap. Only
+        // `GRCh38.p13` used to be special-cased; the whole class is handled now.
+        for (patched, base) in [
+            ("GRCh38.p13", "GRCh38"),
+            ("GRCh37.p13", "GRCh37"),
+            ("GRCh37.p13", "hg19"),
+            ("grch38.p14", "hg38"),
+            ("NCBI36.p1", "hg18"),
+        ] {
+            assert!(build_matches(patched, base), "{patched} != {base}");
+        }
+        // Patch stripping must not blur genuinely different assemblies...
+        assert!(!build_matches("GRCh37.p13", "GRCh38"));
+        assert!(!build_matches("GRCh38.p13", "hg19"));
+        // ...nor eat a suffix that is not a patch number.
+        assert_eq!(strip_patch_suffix("grch37.plus"), "grch37.plus");
+        assert_eq!(strip_patch_suffix("grch37.p"), "grch37.p");
+        assert_eq!(strip_patch_suffix("grch37"), "grch37");
+        assert_eq!(strip_patch_suffix("hs37d5.fa"), "hs37d5.fa");
+    }
+
+    #[test]
     fn header_requires_core_columns_and_accepts_variants() {
         // Older TCGA spelling is canonicalized.
         let h = MafHeader::parse(
@@ -825,13 +811,5 @@ mod tests {
         );
         let h = read_header(&mut r).unwrap();
         assert!(h.has("Tumor_Sample_Barcode"));
-    }
-
-    #[test]
-    fn unnormalized_key_is_deterministic() {
-        let a = UnnormalizedVariant::new("GRCh38", "1", 100, "A", "-", "unknown contig");
-        let b = UnnormalizedVariant::new("GRCh38", "1", 100, "A", "-", "different reason");
-        assert_eq!(a.key, b.key);
-        assert_eq!(a.key, "GRCh38:1:100:A:-");
     }
 }

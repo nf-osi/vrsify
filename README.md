@@ -32,7 +32,7 @@ $ vrsify --vcf cohort.vcf.gz --seqmap seqmap.tsv --reference GRCh38.fa \
 {"variant":"ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt","biosample":"S1",
  "zygosity":"heterozygous","referenceName":"19","assemblyId":"GRCh38",
  "sourcePos":44908822,"sourceContig":"chr19","referenceBases":"C","alternateBases":"T",
- "sourceFile":"cohort.vcf.gz","type":"VariantCall"}
+ "sourceFile":"cohort.vcf.gz","type":"VariantObservation"}
 ```
 
 ## Why
@@ -192,29 +192,36 @@ run summary rather than failing the row.
   also stop conversion. Output files from a failed run may contain earlier rows and
   must not be treated as complete.
 - **Assembly is part of identity.** A row whose `NCBI_Build` disagrees with the seqmap's
-  `assemblyId` never gets a VRS id (handled assemblies are `hg38`/`GRCh38` and `hg19`/`GRCh37`). 
-  Real studies do mix builds — one we ingested had 29 GRCh37 rows inside an
+  `assemblyId` never gets a VRS id (handled assemblies are `hg38`/`GRCh38`,
+  `hg19`/`GRCh37` and `hg18`/`NCBI36`, each with any `.p13`-style GRC patch suffix — a
+  patch release adds scaffolds without moving primary-assembly coordinates, so
+  `GRCh37.p13` and `GRCh37` are the same coordinate system and must not read as a
+  mismatch). Real studies do mix builds — one we ingested had 29 GRCh37 rows inside an
   otherwise GRCh38 study, which would otherwise have been hashed against GRCh38
   accessions and given plausible, wrong ids.
-- **Nothing is discarded.** Rows that can't be given an identity — unknown contig,
-  assembly mismatch, non-nucleotide alleles — are still written to the alleles stream as
-  `{"type":"UnnormalizedVariant","unnormalized":true, …,"reason":…}` with a deterministic
-  `{assembly}:{chrom}:{pos}:{ref}:{alt}` key, and counted in the run summary. Their
-  observations are written too, referencing that `nf:variant/…` id, so the sample, study
-  and source of a rejected row survive even though its VRS identity does not — two
-  samples carrying the same unknown-contig variant still yield two observations. The
-  node and observations use the source/CLI assembly when present, otherwise the resolved
-  seqmap assembly, with `unknown` used only when neither can identify it.
-  `--strict` turns them into a hard failure instead.
+- **Nothing is discarded.** Records that can't be given an identity — unknown contig,
+  assembly mismatch (MAF), non-nucleotide alleles — are still written to the alleles
+  stream as `{"type":"UnnormalizedVariant","unnormalized":true, …,"reason":…}` with a
+  deterministic `{assembly}:{chrom}:{pos}:{ref}:{alt}` key, and counted in the run
+  summary. Their observations are written too, referencing that `nf:variant/…` id, so
+  the sample, study and source of a rejected record survive even though its VRS
+  identity does not — two samples carrying the same unknown-contig variant still yield
+  two observations. The node and observations use the source/CLI assembly when present,
+  otherwise the resolved seqmap assembly, with `unknown` used only when neither can
+  identify it. **This holds for both front ends**, and `--strict` turns it into a hard
+  failure in either. On the VCF path, pass `--assembly` so unknown-contig keys are
+  something better than `unknown:…` (a seqmap `assemblyId` always wins over it).
 - **No silent filtering.** `--min-tumor-alt-count` is **off** by default. It exists
   because real MAFs contain rows with `t_alt_count = 0` — no read in the tumor supports
   the allele (28% of rows in one study we ingested). Recording those as "this specimen
   carries this variant" would be wrong, so pass `--min-tumor-alt-count 1` when that
   applies; nothing is filtered unless you ask.
-- Symbolic and structural VCF ALTs (`<DEL>`, breakends) are skipped and counted, and —
-  matching the MAF rule above — VCF records whose REF or ALT is not plain `ACGTN`
-  (IUPAC ambiguity codes, caller junk) are never given a VRS id; they are skipped and
-  counted in a warning.
+- **Structural variants are out of scope, explicitly.** Symbolic and structural VCF
+  ALTs (`<DEL>`, breakends) and the `*` spanning-deletion placeholder are the one thing
+  that is skipped rather than kept: a `<DEL>` is defined by `INFO/END` or `SVLEN`, which
+  a `{ref}:{alt}`-keyed node would silently drop, and `*` is not an allele of its own.
+  They are counted in the run summary. VCF records with no `POS` are likewise counted
+  and skipped — there is no locus to key a variant on.
 
 ## Correctness
 
@@ -233,7 +240,13 @@ VRS ids are worthless unless they are byte-identical to everyone else's.
 - missing MAF alleles, reference/seqmap identity and REF mismatches, interval bounds,
   identity-allele normalization, and warnings/markers for VCF indels without a reference;
 - reference-free trimming (padded substitutions reach the canonical id with or without
-  `--reference`, in both formats) and the non-ACGTN skip on the VCF path.
+  `--reference`, in both formats), and that identity alleles (`REF == ALT`) reach one id
+  either way;
+- that both front ends keep unknown-contig and non-ACGTN records as
+  `UnnormalizedVariant` nodes with their observations, honour `--strict`, and label
+  observations with the same `type`;
+- GRC patch-release builds (`GRCh37.p13`) matching their base assembly, and per-ALT
+  `CSQ` selection + percent-decoding on multiallelic records.
 
 Two checks need multi-GB reference files and so are not part of `cargo test`, but were
 run against real data: `vrsify seqmap` over GRCh38 chr19 reproduces GA4GH's canonical
@@ -271,8 +284,14 @@ FASTA), HGVS or SPDI translation, transcript-level projection.
 
 VEP `CSQ` and snpEff `ANN` INFO annotations, when present, are carried onto each
 observation as `affectedGene` / `affectedGeneSymbol` / `aminoacidChange` /
-`molecularConsequence` (never onto the context-free allele), taking the first
-(most-severe) transcript.
+`molecularConsequence` (never onto the context-free allele). A `CSQ`/`ANN` value holds
+one entry per (allele, transcript), so entries are first filtered to the ALT being
+observed — by `ALLELE_NUM` when VEP wrote it, otherwise by the allele column, allowing
+for VEP's minimal (`-`-padded) indel spelling — and the first survivor is taken, which
+is the most-severe one. That matters on multiallelic records and on records split by
+`bcftools norm -m-`, which leaves the full original `CSQ` on every split line. Field
+values are percent-decoded per VCF 4.3 (`p.Cys130%3D` → `p.Cys130=`). Annotation is
+advisory metadata; it never affects the VRS id.
 
 ## License
 

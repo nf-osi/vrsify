@@ -10,5 +10,6 @@ pub mod digest;
 pub mod maf;
 pub mod normalize;
 pub mod refget;
+pub mod unnormalized;
 pub mod vcf;
 pub mod vrs;

@@ -17,10 +17,11 @@ use noodles_vcf as vcf;
 
 use vrsify::maf::{
     allele_bases, build_maf_allele, build_matches, effective_alt, maf_to_interbase, read_header,
-    Depth, MafAnnotation, MafObservation, UnnormalizedVariant,
+    Depth, MafAnnotation, MafObservation,
 };
 use vrsify::normalize::FastaReferences;
 use vrsify::refget::{seqmap_from_fasta, write_seqmap};
+use vrsify::unnormalized::UnnormalizedVariant;
 use vrsify::vcf::{
     build_allele, build_allele_normalized, csq_format_from_description, extract_annotation,
     is_concrete_alt, load_seqmap, resolve_contig, zygosity_for, Observation, SeqMap,
@@ -72,6 +73,18 @@ struct ConvertArgs {
     /// Identifier/URI for the source VCF, recorded on each observation.
     #[arg(long, default_value = "")]
     source: String,
+
+    /// Assembly to record when the seqmap does not declare one — in particular on
+    /// unnormalized records for contigs the seqmap does not contain, whose
+    /// `{assembly}:{chrom}:{pos}:{ref}:{alt}` key would otherwise say `unknown`.
+    /// A seqmap `assemblyId` always wins over this.
+    #[arg(long)]
+    assembly: Option<String>,
+
+    /// Fail instead of emitting unnormalized records (unknown contig / non-ACGTN
+    /// alleles).
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -170,6 +183,20 @@ fn run_seqmap(args: SeqmapArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct VcfCounts {
+    variants: u64,
+    alleles: u64,
+    observations: u64,
+    symbolic_alts: u64,
+    no_position: u64,
+    unknown_contig: u64,
+    non_nucleotide: u64,
+    unnormalized: u64,
+    unnormalized_observations: u64,
+    not_fully_justified: u64,
+}
+
 fn run_convert(args: ConvertArgs) -> Result<()> {
     let vcf_path = args.vcf.as_ref().context("--vcf is required")?;
     let seqmap_path = args.seqmap.as_ref().context("--seqmap is required")?;
@@ -207,33 +234,28 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let mut obs_out = BufWriter::new(File::create(out_obs)?);
 
     let mut seen_alleles: HashSet<String> = HashSet::new();
-    let mut n_variants = 0u64;
-    let mut n_alleles = 0u64;
-    let mut n_obs = 0u64;
-    let mut n_skipped_alt = 0u64;
-    let mut n_non_nucleotide = 0u64;
-    let mut n_not_fully_justified = 0u64;
+    let mut seen_unnormalized: HashSet<String> = HashSet::new();
+    let mut c = VcfCounts::default();
     let mut missing_contigs: HashSet<String> = HashSet::new();
 
-    for result in reader.records() {
+    for (record_no, result) in reader.records().enumerate() {
         let record = result.context("reading VCF record")?;
         let chrom = record.reference_sequence_name().to_string();
         // `chr1` vs `1`: the seqmap may be keyed either way (see `resolve_contig`), and
-        // the resolved key is what the reference FASTA is then looked up by.
-        let (seqmap_key, seq) = match resolve_contig(&seqmap, &chrom) {
-            Some(s) => s,
+        // the resolved key is what the reference FASTA is then looked up by. An
+        // unresolved contig is *not* a reason to drop the record — see `reject` below.
+        let resolved = resolve_contig(&seqmap, &chrom);
+        let pos = match record.variant_start() {
+            Some(p) => usize::from(p.context("parsing POS")?) as i64,
             None => {
-                missing_contigs.insert(chrom);
+                // No POS at all (a telomere record, `.` in the column): there is no
+                // locus to key a variant node on, so there is nothing to keep.
+                c.no_position += 1;
                 continue;
             }
         };
-        let pos = match record.variant_start() {
-            Some(p) => usize::from(p.context("parsing POS")?) as i64,
-            None => continue, // no position (e.g. telomere) — skip.
-        };
         let reference = record.reference_bases().to_string();
         let info = record.info().as_ref().to_string();
-        let annotation = extract_annotation(&info, csq_format.as_deref());
 
         let alts: Vec<String> = record
             .alternate_bases()
@@ -248,17 +270,116 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         let gt_idx = samples.keys().iter().position(|k| k == "GT");
 
         for (i, alt) in alts.iter().enumerate() {
+            let alt_number = i + 1; // VCF: 0=REF, 1=first ALT, ...
             if !is_concrete_alt(alt) {
-                n_skipped_alt += 1;
+                // Symbolic/structural ALTs (`<DEL>`, breakends) and the `*` spanning
+                // deletion are an explicit scope exclusion, not an identity failure:
+                // `<DEL>` is defined by INFO/END or SVLEN, which an
+                // `{assembly}:{chrom}:{pos}:{ref}:{alt}` node would silently drop, and
+                // `*` is not an allele of its own. Counted, never guessed at.
+                c.symbolic_alts += 1;
                 continue;
             }
+
             // Same identity policy as the MAF front end: a non-ACGTN REF or ALT (IUPAC
-            // codes, caller junk) must never be given a `ga4gh:VA.` id.
-            if !is_nucleotide_sequence(&reference) || !is_nucleotide_sequence(alt) {
-                n_non_nucleotide += 1;
+            // codes, caller junk) must never be given a `ga4gh:VA.` id, and neither may
+            // a contig whose sequence the seqmap cannot identify.
+            let reject = match resolved {
+                None => {
+                    missing_contigs.insert(chrom.clone());
+                    c.unknown_contig += 1;
+                    Some("contig is not in the seqmap".to_string())
+                }
+                Some(_) => None,
+            }
+            .or_else(|| {
+                (!is_nucleotide_sequence(&reference) || !is_nucleotide_sequence(alt)).then(|| {
+                    c.non_nucleotide += 1;
+                    format!("non-nucleotide allele(s) '{reference}' / '{alt}'")
+                })
+            });
+
+            // Per-ALT: on a multiallelic record each ALT has its own CSQ/ANN entries,
+            // and a record split by `bcftools norm -m-` keeps the full original list.
+            let annotation =
+                extract_annotation(&info, csq_format.as_deref(), &reference, alt, alt_number);
+
+            // Which sample carries the ALT, and from which file, is record-level
+            // provenance that does not depend on the ALT earning a VRS id: the
+            // observations are built the same way either way, only `variant_id` differs.
+            let write_observations = |variant_id: &str,
+                                          assembly: Option<String>,
+                                          reference_name: &str,
+                                          obs_out: &mut BufWriter<File>|
+             -> Result<u64> {
+                let mut n = 0;
+                for (s_i, sample_name) in sample_names.iter().enumerate() {
+                    let gt = match gt_idx {
+                        Some(gi) => samples
+                            .get_index(s_i)
+                            .and_then(|s| s.as_ref().split(':').nth(gi).map(|v| v.to_string()))
+                            .unwrap_or_else(|| ".".to_string()),
+                        None => continue,
+                    };
+                    if let Some(zyg) = zygosity_for(&gt, alt_number) {
+                        let obs = Observation {
+                            variant_id: variant_id.to_string(),
+                            sample: sample_name.clone(),
+                            zygosity: zyg,
+                            contig: chrom.clone(),
+                            pos,
+                            reference: reference.clone(),
+                            alt: alt.clone(),
+                            assembly: assembly.clone(),
+                            reference_name: reference_name.to_string(),
+                            source: args.source.clone(),
+                            annotation: annotation.clone(),
+                        };
+                        writeln!(obs_out, "{}", serde_json::to_string(&obs.to_json())?)?;
+                        n += 1;
+                    }
+                }
+                Ok(n)
+            };
+
+            if let Some(reason) = reject {
+                if args.strict {
+                    bail!(
+                        "VCF record {} ({chrom}:{pos} {reference}>{alt}): {reason}",
+                        record_no + 1
+                    );
+                }
+                // One assembly value for the local node identity, its metadata, and
+                // every observation that references it: the seqmap when the contig
+                // resolved, else the CLI's `--assembly`, else `unknown`.
+                let assembly = resolved
+                    .and_then(|(_, s)| s.assembly.clone())
+                    .or_else(|| args.assembly.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let u = UnnormalizedVariant::new(&assembly, &chrom, pos, &reference, alt, reason);
+                if seen_unnormalized.insert(u.key.clone()) {
+                    writeln!(allele_out, "{}", serde_json::to_string(&u.to_json())?)?;
+                    c.unnormalized += 1;
+                }
+                // The variant node is deduplicated, the observations are not: every
+                // sample carrying the ALT still gets a record, pointed at that node.
+                let reference_name = resolved
+                    .map(|(_, s)| s.reference_name.clone())
+                    .unwrap_or_else(|| chrom.clone());
+                let n = write_observations(
+                    &u.id(),
+                    Some(assembly),
+                    &reference_name,
+                    &mut obs_out,
+                )?;
+                // Counted in the total too, so the summary matches the observation file.
+                c.observations += n;
+                c.unnormalized_observations += n;
                 continue;
             }
-            n_variants += 1;
+
+            let (seqmap_key, seq) = resolved.expect("rejected above when absent");
+            c.variants += 1;
 
             let refseq = references
                 .as_ref()
@@ -276,48 +397,26 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                 None => build_allele(seq, pos, &reference, alt),
             };
             if !fully_justified {
-                n_not_fully_justified += 1;
+                c.not_fully_justified += 1;
             }
             let vid = allele.ga4gh_id();
 
             if seen_alleles.insert(vid.clone()) {
                 let mut value = allele.to_output_value();
                 if !fully_justified {
+                    // Output-only marker; it is not part of the VRS digest.
                     value["fullyJustified"] = false.into();
                 }
                 writeln!(allele_out, "{}", serde_json::to_string(&value)?)?;
-                n_alleles += 1;
+                c.alleles += 1;
             }
 
-            let alt_number = i + 1; // VCF: 0=REF, 1=first ALT, ...
-            for (s_i, sample_name) in sample_names.iter().enumerate() {
-                let gt = match gt_idx {
-                    Some(gi) => samples
-                        .get_index(s_i)
-                        .and_then(|s| {
-                            s.as_ref().split(':').nth(gi).map(|v| v.to_string())
-                        })
-                        .unwrap_or_else(|| ".".to_string()),
-                    None => continue,
-                };
-                if let Some(zyg) = zygosity_for(&gt, alt_number) {
-                    let obs = Observation {
-                        variant_id: vid.clone(),
-                        sample: sample_name.clone(),
-                        zygosity: zyg,
-                        contig: chrom.clone(),
-                        pos,
-                        reference: reference.clone(),
-                        alt: alt.clone(),
-                        assembly: seq.assembly.clone(),
-                        reference_name: seq.reference_name.clone(),
-                        source: args.source.clone(),
-                        annotation: annotation.clone(),
-                    };
-                    writeln!(obs_out, "{}", serde_json::to_string(&obs.to_json())?)?;
-                    n_obs += 1;
-                }
-            }
+            c.observations += write_observations(
+                &vid,
+                seq.assembly.clone().or_else(|| args.assembly.clone()),
+                &seq.reference_name,
+                &mut obs_out,
+            )?;
         }
     }
 
@@ -325,26 +424,35 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     obs_out.flush()?;
 
     eprintln!(
-        "vrsify: {n_variants} variant-alleles, {n_alleles} unique, {n_obs} observations, \
-         {n_skipped_alt} non-concrete ALTs skipped"
+        "vrsify: {} variant-alleles, {} unique, {} observations, {} non-concrete ALTs skipped",
+        c.variants, c.alleles, c.observations, c.symbolic_alts
     );
-    if n_non_nucleotide > 0 {
+    if c.unnormalized > 0 {
         eprintln!(
-            "vrsify: WARNING — {n_non_nucleotide} variant-allele(s) with non-ACGTN REF/ALT \
-             skipped (no VRS id minted)"
+            "vrsify: {} unnormalized variant(s) kept with {} observation(s) (unknown \
+             contig {}, non-nucleotide alleles {})",
+            c.unnormalized, c.unnormalized_observations, c.unknown_contig, c.non_nucleotide
         );
     }
-    if n_not_fully_justified > 0 {
+    if c.no_position > 0 {
         eprintln!(
-            "vrsify: WARNING — {n_not_fully_justified} indel allele(s) are NOT fully justified \
-             (no --reference); their ga4gh ids may not match normalized variants"
+            "vrsify: WARNING — {} record(s) had no POS and were skipped (no locus to key \
+             a variant on)",
+            c.no_position
+        );
+    }
+    if c.not_fully_justified > 0 {
+        eprintln!(
+            "vrsify: WARNING — {} indel allele(s) are NOT fully justified \
+             (no --reference); their ga4gh ids may not match normalized variants",
+            c.not_fully_justified
         );
     }
     if !missing_contigs.is_empty() {
         let mut v: Vec<_> = missing_contigs.into_iter().collect();
         v.sort();
         eprintln!(
-            "vrsify: WARNING — contigs missing from seqmap (skipped): {}",
+            "vrsify: WARNING — contigs missing from seqmap (kept as unnormalized): {}",
             v.join(", ")
         );
     }
