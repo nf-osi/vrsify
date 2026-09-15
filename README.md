@@ -203,7 +203,7 @@ run summary rather than failing the row.
   assembly mismatch (MAF), non-nucleotide alleles — are still written to the alleles
   stream as `{"type":"UnnormalizedVariant","unnormalized":true, …,"reason":…}` with a
   deterministic `{assembly}:{chrom}:{pos}:{ref}:{alt}` key, and counted in the run
-  summary. Their observations are written too, referencing that `nf:variant/…` id, so
+  summary. Their observations are written too, referencing that local id, so
   the sample, study and source of a rejected record survive even though its VRS
   identity does not — two samples carrying the same unknown-contig variant still yield
   two observations. The node and observations use the source/CLI assembly when present,
@@ -211,6 +211,17 @@ run summary rather than failing the row.
   identify it. **This holds for both front ends**, and `--strict` turns it into a hard
   failure in either. On the VCF path, pass `--assembly` so unknown-contig keys are
   something better than `unknown:…` (a seqmap `assemblyId` always wins over it).
+- **Local ids get no default namespace.** A `ga4gh:VA.` id is a digest, so `vrsify`
+  computes it unaided and it means the same thing to everyone. The id of a record that
+  *cannot* be normalized is the opposite: a deterministic key over the source
+  coordinates, unique only within whoever minted it. There is no correct namespace to
+  guess — defaulting to one would label your data as somebody else's, and two orgs'
+  outputs would collide on identical keys while claiming to be each other's terms. So
+  the first unnormalizable record stops the run until you pass
+  `--variant-id-prefix` (used verbatim, separator included: `--variant-id-prefix
+  nf:variant/` yields `nf:variant/GRCh38:chr1:100:A:T`). The requirement is lazy — a
+  file with nothing to reject never needs the flag — and `--strict` is the other way
+  out, since rejecting those records outright means no local id is needed at all.
 - **No silent filtering.** `--min-tumor-alt-count` is **off** by default. It exists
   because real MAFs contain rows with `t_alt_count = 0` — no read in the tumor supports
   the allele (28% of rows in one study we ingested). Recording those as "this specimen
@@ -243,8 +254,9 @@ VRS ids are worthless unless they are byte-identical to everyone else's.
   `--reference`, in both formats), and that identity alleles (`REF == ALT`) reach one id
   either way;
 - that both front ends keep unknown-contig and non-ACGTN records as
-  `UnnormalizedVariant` nodes with their observations, honour `--strict`, and label
-  observations with the same `type`;
+  `UnnormalizedVariant` nodes with their observations, honour `--strict`, label
+  observations with the same `type`, and refuse to invent an id namespace for a local
+  id rather than defaulting to ours;
 - GRC patch-release builds (`GRCh37.p13`) matching their base assembly, and per-ALT
   `CSQ` selection + percent-decoding on multiallelic records.
 

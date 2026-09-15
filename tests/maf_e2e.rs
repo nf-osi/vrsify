@@ -415,7 +415,15 @@ fn rows_without_a_vrs_identity_are_kept_as_unnormalized() {
         &dir,
         &maf,
         &seqmap,
-        &["--study-id", "test_study", "--source", "syn9/odd.maf"],
+        &[
+            "--study-id",
+            "test_study",
+            "--source",
+            "syn9/odd.maf",
+            // A local id has no correct default namespace, so the caller names one.
+            "--variant-id-prefix",
+            "nf:variant/",
+        ],
     );
     let alleles = json_lines(&alleles);
     assert_eq!(alleles.len(), 2, "both odd rows are kept, got {alleles:#?}");

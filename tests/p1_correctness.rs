@@ -304,7 +304,7 @@ fn non_nucleotide_vcf_alleles_are_kept_unnormalized_not_minted() {
     let f = Fixture::new();
     let rows = row(false, 4, "A", "Z") + &row(false, 5, "A", "R") + &row(false, 4, "A", "T");
     for reference in [None, Some("ref.fa")] {
-        let output = f.run(false, &rows, reference, &[]);
+        let output = f.run(false, &rows, reference, &["--variant-id-prefix", "nf:variant/"]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stderr}");
         assert!(stderr.contains("non-nucleotide alleles 2"), "{stderr}");
@@ -343,7 +343,12 @@ fn unknown_vcf_contigs_are_kept_unnormalized_with_their_observations() {
     let rows = "chrZ\t4\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n".to_string()
         + "chrZ\t4\t.\tA\tT\t.\tPASS\t.\tGT\t1/1\n"
         + &row(false, 4, "A", "T");
-    let output = f.run(false, &rows, None, &["--assembly", "GRCh38"]);
+    let output = f.run(
+        false,
+        &rows,
+        None,
+        &["--assembly", "GRCh38", "--variant-id-prefix", "nf:variant/"],
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(stderr.contains("1 unnormalized variant(s) kept with 2 observation(s)"), "{stderr}");
@@ -435,6 +440,59 @@ fn identity_alleles_agree_across_naive_and_normalized_paths() {
     assert_eq!(ids[0], ids[1]);
 }
 
+/// P3: the local id of an unnormalizable record used to be hardcoded to the
+/// `nf:variant/` namespace, so anyone outside NF-OSI got ids asserting a namespace they
+/// have no claim to — and two orgs' outputs would collide on identical keys while
+/// claiming to be NF terms. There is no correct default, so the run now stops and asks.
+#[test]
+fn a_local_variant_id_needs_an_explicit_namespace() {
+    let f = Fixture::new();
+    let unknown_contig = "chrZ\t4\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n".to_string();
+    let junk_allele = row(true, 4, "A", "Z");
+
+    // Refused, in both front ends, with the two ways out named.
+    for (maf, rows) in [(false, &unknown_contig), (true, &junk_allele)] {
+        let output = f.run(maf, rows, None, &[]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "expected a refusal: {stderr}");
+        assert!(stderr.contains("--variant-id-prefix was not supplied"), "{stderr}");
+        assert!(stderr.contains("--strict"), "the alternative must be named: {stderr}");
+        // ...and no half-namespaced id is written before the refusal.
+        assert!(!f.json("alleles.ndjson").iter().any(|a| a["unnormalized"] == true));
+    }
+
+    // Supplying one is enough, and it is used verbatim — no `nf:` anywhere. The seqmap
+    // here declares no assembly and neither run passes `--assembly`, so the key's
+    // assembly field is `unknown`; the prefix is the only thing under our control.
+    for (maf, rows, key) in [
+        (false, &unknown_contig, "unknown:chrZ:4:A:T"),
+        (true, &junk_allele, "unknown:chr1:4:A:Z"),
+    ] {
+        let output = f.run(maf, rows, None, &["--variant-id-prefix", "https://ex.org/v/"]);
+        assert!(output.status.success(), "{output:?}");
+        let alleles = f.json("alleles.ndjson");
+        assert_eq!(alleles.len(), 1);
+        assert_eq!(alleles[0]["id"], format!("https://ex.org/v/{key}"));
+        assert_eq!(f.json("obs.ndjson")[0]["variant"], alleles[0]["id"]);
+    }
+
+    // `--strict` is the other way out, and needs no prefix at all.
+    for (maf, rows) in [(false, &unknown_contig), (true, &junk_allele)] {
+        let output = f.run(maf, rows, None, &["--strict"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(!stderr.contains("--variant-id-prefix"), "strict needs no prefix: {stderr}");
+    }
+
+    // A file with nothing to reject never needs the flag: the requirement is lazy, so
+    // it cannot break a run that was already convertible.
+    for maf in [false, true] {
+        let output = f.run(maf, &row(maf, 4, "A", "T"), None, &[]);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(f.json("alleles.ndjson").len(), 1);
+    }
+}
+
 /// P3: only `GRCh38.p13` was aliased, so a `GRCh37.p13` row (and patch suffixes
 /// generally) read as an assembly mismatch and lost its VRS id. A patch release does
 /// not move primary-assembly coordinates, so it must match its base assembly.
@@ -492,7 +550,12 @@ fn rejected_variant_and_observation_share_seqmap_assembly() {
     )
     .unwrap();
 
-    let output = f.run(true, &row(true, 4, "A", "Z"), None, &[]);
+    let output = f.run(
+        true,
+        &row(true, 4, "A", "Z"),
+        None,
+        &["--variant-id-prefix", "nf:variant/"],
+    );
     assert!(output.status.success(), "{:?}", output);
 
     let alleles = f.json("alleles.ndjson");

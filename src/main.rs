@@ -85,6 +85,15 @@ struct ConvertArgs {
     /// alleles).
     #[arg(long)]
     strict: bool,
+
+    /// Id namespace for records that cannot be given a VRS id, used verbatim (include
+    /// the separator: `nf:variant/` yields `nf:variant/GRCh38:chr1:100:A:T`). Required
+    /// only once such a record is actually encountered, because its id is local — it
+    /// means something only inside the namespace that minted it, and guessing one would
+    /// stamp your data with someone else's. Use `--strict` to reject those records
+    /// outright instead.
+    #[arg(long)]
+    variant_id_prefix: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -158,6 +167,15 @@ struct MafArgs {
     /// non-ACGTN alleles).
     #[arg(long)]
     strict: bool,
+
+    /// Id namespace for rows that cannot be given a VRS id, used verbatim (include the
+    /// separator: `nf:variant/` yields `nf:variant/GRCh38:chr1:100:A:T`). Required only
+    /// once such a row is actually encountered, because its id is local — it means
+    /// something only inside the namespace that minted it, and guessing one would stamp
+    /// your data with someone else's. Use `--strict` to reject those rows outright
+    /// instead.
+    #[arg(long)]
+    variant_id_prefix: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -356,7 +374,12 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                     .and_then(|(_, s)| s.assembly.clone())
                     .or_else(|| args.assembly.clone())
                     .unwrap_or_else(|| "unknown".to_string());
-                let u = UnnormalizedVariant::new(&assembly, &chrom, pos, &reference, alt, reason);
+                let prefix = local_id_prefix(args.variant_id_prefix.as_ref(), &reason, || {
+                    format!("VCF record {} ({chrom}:{pos} {reference}>{alt})", record_no + 1)
+                })?;
+                let u = UnnormalizedVariant::new(
+                    prefix, &assembly, &chrom, pos, &reference, alt, reason,
+                );
                 if seen_unnormalized.insert(u.key.clone()) {
                     writeln!(allele_out, "{}", serde_json::to_string(&u.to_json())?)?;
                     c.unnormalized += 1;
@@ -476,6 +499,31 @@ fn reference_contig<'a>(
         }
     }
     None
+}
+
+/// The `--variant-id-prefix` to mint a rejected record's local id under, or a refusal.
+///
+/// A `ga4gh:VA.` id is a digest: it means the same thing to everyone, so `vrsify` can
+/// compute it unaided. The id of a record that *cannot* be normalized is the opposite —
+/// a deterministic key over the source coordinates, unique only within whoever minted
+/// it. There is no correct namespace to default to, and picking one would label a
+/// stranger's data as ours, so the run stops until the caller says which to use.
+/// `record` is only formatted on the failure path.
+fn local_id_prefix<'a>(
+    prefix: Option<&'a String>,
+    reason: &str,
+    record: impl FnOnce() -> String,
+) -> Result<&'a str> {
+    match prefix {
+        Some(p) => Ok(p.as_str()),
+        None => bail!(
+            "{} cannot be given a VRS id ({reason}), so it needs a local id, but \
+             --variant-id-prefix was not supplied and there is no namespace to default \
+             to. Pass --variant-id-prefix (e.g. 'nf:variant/') to choose one, or \
+             --strict to reject such records instead of keeping them.",
+            record()
+        ),
+    }
 }
 
 /// True if every base is an unambiguous/ambiguous nucleotide code VRS can carry. MAF
@@ -665,7 +713,11 @@ fn run_maf(args: MafArgs) -> Result<()> {
                 .clone()
                 .or_else(|| resolved.and_then(|(_, s)| s.assembly.clone()))
                 .unwrap_or_else(|| "unknown".to_string());
+            let prefix = local_id_prefix(args.variant_id_prefix.as_ref(), &reason, || {
+                format!("MAF row {} ({contig}:{start} {ref_raw}>{alt_raw})", c.rows)
+            })?;
             let u = UnnormalizedVariant::new(
+                prefix,
                 &unnormalized_assembly,
                 &contig,
                 start,
