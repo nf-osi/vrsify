@@ -47,6 +47,9 @@ fn reads_bgzipped_multisample_vcf() {
             obs.to_str().unwrap(),
             "--source",
             "syn/test.vcf.gz",
+            // This fixture is meant to convert whole; refuse anything unidentifiable
+            // rather than naming a namespace to keep it under.
+            "--strict",
         ])
         .status()
         .unwrap();

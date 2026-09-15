@@ -18,7 +18,8 @@ or representation bookkeeping needed.
 
 ```
 $ vrsify --vcf cohort.vcf.gz --seqmap seqmap.tsv --reference GRCh38.fa \
-         --out-alleles alleles.ndjson --out-observations obs.ndjson
+         --out-alleles alleles.ndjson --out-observations obs.ndjson \
+         --variant-id-prefix "nf:variant/"
 
 # alleles.ndjson  (context-free: exactly id + location + state + type)
 {"id":"ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt",
@@ -217,11 +218,14 @@ run summary rather than failing the row.
   coordinates, unique only within whoever minted it. There is no correct namespace to
   guess — defaulting to one would label your data as somebody else's, and two orgs'
   outputs would collide on identical keys while claiming to be each other's terms. So
-  the first unnormalizable record stops the run until you pass
-  `--variant-id-prefix` (used verbatim, separator included: `--variant-id-prefix
-  nf:variant/` yields `nf:variant/GRCh38:chr1:100:A:T`). The requirement is lazy — a
-  file with nothing to reject never needs the flag — and `--strict` is the other way
-  out, since rejecting those records outright means no local id is needed at all.
+  every run must name one with `--variant-id-prefix` (used verbatim, separator
+  included: `--variant-id-prefix nf:variant/` yields
+  `nf:variant/GRCh38:chr1:100:A:T`). `--strict` is the other way out, and needs no
+  prefix, since rejecting those records outright means no local id is ever minted.
+  The choice is settled from the arguments before the input is opened, not at the
+  first record that needs it: a failed run's output holds only however much was
+  written before the error, so a late failure would throw away every record converted
+  up to that point.
 - **No silent filtering.** `--min-tumor-alt-count` is **off** by default. It exists
   because real MAFs contain rows with `t_alt_count = 0` — no read in the tumor supports
   the allele (28% of rows in one study we ingested). Recording those as "this specimen
@@ -255,8 +259,8 @@ VRS ids are worthless unless they are byte-identical to everyone else's.
   either way;
 - that both front ends keep unknown-contig and non-ACGTN records as
   `UnnormalizedVariant` nodes with their observations, honour `--strict`, label
-  observations with the same `type`, and refuse to invent an id namespace for a local
-  id rather than defaulting to ours;
+  observations with the same `type`, and refuse — on argument grounds, before reading
+  the input — to invent an id namespace for a local id rather than defaulting to ours;
 - GRC patch-release builds (`GRCh37.p13`) matching their base assembly, and per-ALT
   `CSQ` selection + percent-decoding on multiallelic records.
 
@@ -271,13 +275,14 @@ Reproduce end-to-end from the bundled examples:
 ```sh
 vrsify --vcf examples/sample.vcf --seqmap examples/seqmap.tsv \
   --out-alleles examples/alleles.ndjson --out-observations examples/obs.ndjson \
-  --source "syn12345/test.vcf"
+  --source "syn12345/test.vcf" --strict
 grep -q 'ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt' examples/alleles.ndjson \
   && echo "rs7412 VA id matches the GA4GH golden fixture"
 
 vrsify maf --maf examples/sample.maf --seqmap examples/seqmap.tsv \
   --out-alleles examples/maf_alleles.ndjson --out-observations examples/maf_obs.ndjson \
-  --study-id nst_nfosi_ntap --source "cbioportal:nst_nfosi_ntap/data_mutations.txt"
+  --study-id nst_nfosi_ntap --source "cbioportal:nst_nfosi_ntap/data_mutations.txt" \
+  --strict
 grep -q 'ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt' examples/maf_alleles.ndjson \
   && echo "the MAF path reproduces the same id"
 ```

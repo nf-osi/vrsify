@@ -48,7 +48,18 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 /// Run `vrsify maf` and return (alleles NDJSON, observations NDJSON, stderr).
+///
+/// Every run needs either an id namespace for records that cannot be normalized or
+/// `--strict` to refuse them. These fixtures are meant to convert whole, so `--strict`
+/// is the default here and a surprise rejection fails the test loudly; the one test
+/// about kept records passes `--variant-id-prefix` and opts out.
 fn run_maf(dir: &Path, maf: &Path, seqmap: &Path, extra: &[&str]) -> (String, String, String) {
+    let mut args: Vec<&str> = Vec::new();
+    if !extra.contains(&"--variant-id-prefix") {
+        args.push("--strict");
+    }
+    args.extend_from_slice(extra);
+    let extra = &args[..];
     let alleles = dir.join("alleles.ndjson");
     let obs = dir.join("obs.ndjson");
     let out = bin()
@@ -245,6 +256,7 @@ fn maf_and_vcf_indel_agree_after_normalization() {
         .arg(&vcf_alleles)
         .arg("--out-observations")
         .arg(dir.join("vcf_obs.ndjson"))
+        .arg("--strict")
         .status()
         .unwrap();
     assert!(status.success());
@@ -297,6 +309,7 @@ fn maf_and_vcf_indel_agree_after_normalization() {
         .arg(&ins_vcf_alleles)
         .arg("--out-observations")
         .arg(dir.join("ins_vcf_obs.ndjson"))
+        .arg("--strict")
         .status()
         .unwrap();
     assert!(status.success());

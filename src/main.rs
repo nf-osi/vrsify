@@ -87,11 +87,10 @@ struct ConvertArgs {
     strict: bool,
 
     /// Id namespace for records that cannot be given a VRS id, used verbatim (include
-    /// the separator: `nf:variant/` yields `nf:variant/GRCh38:chr1:100:A:T`). Required
-    /// only once such a record is actually encountered, because its id is local — it
-    /// means something only inside the namespace that minted it, and guessing one would
-    /// stamp your data with someone else's. Use `--strict` to reject those records
-    /// outright instead.
+    /// the separator: `nf:variant/` yields `nf:variant/GRCh38:chr1:100:A:T`). Such an
+    /// id is local — it means something only inside the namespace that minted it, so
+    /// there is no correct default and one must be named. Required unless `--strict`,
+    /// which rejects those records outright and so needs no local id.
     #[arg(long)]
     variant_id_prefix: Option<String>,
 }
@@ -169,11 +168,10 @@ struct MafArgs {
     strict: bool,
 
     /// Id namespace for rows that cannot be given a VRS id, used verbatim (include the
-    /// separator: `nf:variant/` yields `nf:variant/GRCh38:chr1:100:A:T`). Required only
-    /// once such a row is actually encountered, because its id is local — it means
-    /// something only inside the namespace that minted it, and guessing one would stamp
-    /// your data with someone else's. Use `--strict` to reject those rows outright
-    /// instead.
+    /// separator: `nf:variant/` yields `nf:variant/GRCh38:chr1:100:A:T`). Such an id is
+    /// local — it means something only inside the namespace that minted it, so there is
+    /// no correct default and one must be named. Required unless `--strict`, which
+    /// rejects those rows outright and so needs no local id.
     #[arg(long)]
     variant_id_prefix: Option<String>,
 }
@@ -223,6 +221,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         .out_observations
         .as_ref()
         .context("--out-observations is required")?;
+    let unidentified = Unidentified::from_args(args.variant_id_prefix.clone(), args.strict)?;
 
     let seqmap = load_seqmap(std::io::BufReader::new(
         File::open(seqmap_path).with_context(|| format!("opening seqmap {seqmap_path:?}"))?,
@@ -361,12 +360,12 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             };
 
             if let Some(reason) = reject {
-                if args.strict {
+                let Unidentified::KeepUnder(prefix) = &unidentified else {
                     bail!(
                         "VCF record {} ({chrom}:{pos} {reference}>{alt}): {reason}",
                         record_no + 1
                     );
-                }
+                };
                 // One assembly value for the local node identity, its metadata, and
                 // every observation that references it: the seqmap when the contig
                 // resolved, else the CLI's `--assembly`, else `unknown`.
@@ -374,9 +373,6 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                     .and_then(|(_, s)| s.assembly.clone())
                     .or_else(|| args.assembly.clone())
                     .unwrap_or_else(|| "unknown".to_string());
-                let prefix = local_id_prefix(args.variant_id_prefix.as_ref(), &reason, || {
-                    format!("VCF record {} ({chrom}:{pos} {reference}>{alt})", record_no + 1)
-                })?;
                 let u = UnnormalizedVariant::new(
                     prefix, &assembly, &chrom, pos, &reference, alt, reason,
                 );
@@ -501,28 +497,41 @@ fn reference_contig<'a>(
     None
 }
 
-/// The `--variant-id-prefix` to mint a rejected record's local id under, or a refusal.
+/// What to do with a record that cannot be given a VRS id, settled before any work.
 ///
 /// A `ga4gh:VA.` id is a digest: it means the same thing to everyone, so `vrsify` can
 /// compute it unaided. The id of a record that *cannot* be normalized is the opposite —
 /// a deterministic key over the source coordinates, unique only within whoever minted
 /// it. There is no correct namespace to default to, and picking one would label a
-/// stranger's data as ours, so the run stops until the caller says which to use.
-/// `record` is only formatted on the failure path.
-fn local_id_prefix<'a>(
-    prefix: Option<&'a String>,
-    reason: &str,
-    record: impl FnOnce() -> String,
-) -> Result<&'a str> {
-    match prefix {
-        Some(p) => Ok(p.as_str()),
-        None => bail!(
-            "{} cannot be given a VRS id ({reason}), so it needs a local id, but \
-             --variant-id-prefix was not supplied and there is no namespace to default \
-             to. Pass --variant-id-prefix (e.g. 'nf:variant/') to choose one, or \
-             --strict to reject such records instead of keeping them.",
-            record()
-        ),
+/// stranger's data as ours, so the caller names one (or opts out with `--strict`).
+///
+/// The decision is made from the arguments, up front: a failed run's output files hold
+/// however much was written before the error and cannot be used, so discovering a
+/// missing prefix at the first unidentifiable record would throw away every record
+/// converted before it. Holding the prefix in the `KeepUnder` arm also means the reject
+/// path cannot reach for a namespace that was never supplied.
+enum Unidentified {
+    /// Keep the record as a local node, minting its id under this namespace.
+    KeepUnder(String),
+    /// `--strict`: fail the run instead of keeping it, so no local id is ever needed.
+    Reject,
+}
+
+impl Unidentified {
+    fn from_args(prefix: Option<String>, strict: bool) -> Result<Self> {
+        match (strict, prefix) {
+            // `--strict` keeps no local ids, so a prefix is moot rather than conflicting.
+            (true, _) => Ok(Self::Reject),
+            (false, Some(p)) => Ok(Self::KeepUnder(p)),
+            (false, None) => bail!(
+                "--variant-id-prefix is required. Records that cannot be given a VRS id \
+                 (unknown contig, non-ACGTN alleles, MAF assembly mismatch) are kept \
+                 under a local id, whose namespace is only meaningful to whoever minted \
+                 it — there is no correct default. Pass --variant-id-prefix (e.g. \
+                 'nf:variant/'), or --strict to reject such records instead of keeping \
+                 them."
+            ),
+        }
     }
 }
 
@@ -553,6 +562,7 @@ struct MafCounts {
 }
 
 fn run_maf(args: MafArgs) -> Result<()> {
+    let unidentified = Unidentified::from_args(args.variant_id_prefix.clone(), args.strict)?;
     let seqmap: SeqMap = load_seqmap(std::io::BufReader::new(
         File::open(&args.seqmap)
             .with_context(|| format!("opening seqmap {:?}", args.seqmap))?,
@@ -703,9 +713,9 @@ fn run_maf(args: MafArgs) -> Result<()> {
         };
 
         if let Some(reason) = reject {
-            if args.strict {
+            let Unidentified::KeepUnder(prefix) = &unidentified else {
                 bail!("MAF row {} ({contig}:{start} {ref_raw}>{alt_raw}): {reason}", c.rows);
-            }
+            };
             // Use one assembly value for the local node identity, its metadata, and
             // every observation that references it. A resolved seqmap supplies the
             // assembly when the MAF and CLI do not; only an unresolved row is unknown.
@@ -713,9 +723,6 @@ fn run_maf(args: MafArgs) -> Result<()> {
                 .clone()
                 .or_else(|| resolved.and_then(|(_, s)| s.assembly.clone()))
                 .unwrap_or_else(|| "unknown".to_string());
-            let prefix = local_id_prefix(args.variant_id_prefix.as_ref(), &reason, || {
-                format!("MAF row {} ({contig}:{start} {ref_raw}>{alt_raw})", c.rows)
-            })?;
             let u = UnnormalizedVariant::new(
                 prefix,
                 &unnormalized_assembly,

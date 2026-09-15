@@ -33,7 +33,16 @@ impl Fixture {
         Self(dir)
     }
 
+    /// Convert `rows`, supplying the id namespace every non-`--strict` run needs. Tests
+    /// about that requirement itself use [`Fixture::run_raw`].
     fn run(&self, maf: bool, rows: &str, reference: Option<&str>, extra: &[&str]) -> Output {
+        let mut args = vec!["--variant-id-prefix", "nf:variant/"];
+        args.extend_from_slice(extra);
+        self.run_raw(maf, rows, reference, &args)
+    }
+
+    /// Convert `rows` with exactly the arguments given, nothing added.
+    fn run_raw(&self, maf: bool, rows: &str, reference: Option<&str>, extra: &[&str]) -> Output {
         let input = self.0.join(if maf { "input.maf" } else { "input.vcf" });
         let header = if maf { MAF_HEADER } else { VCF_HEADER };
         std::fs::write(&input, format!("{header}{rows}")).unwrap();
@@ -301,7 +310,7 @@ fn non_nucleotide_vcf_alleles_are_kept_unnormalized_not_minted() {
     let f = Fixture::new();
     let rows = row(false, 4, "A", "Z") + &row(false, 5, "A", "R") + &row(false, 4, "A", "T");
     for reference in [None, Some("ref.fa")] {
-        let output = f.run(false, &rows, reference, &["--variant-id-prefix", "nf:variant/"]);
+        let output = f.run(false, &rows, reference, &[]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stderr}");
         assert!(stderr.contains("non-nucleotide alleles 2"), "{stderr}");
@@ -339,12 +348,7 @@ fn unknown_vcf_contigs_are_kept_unnormalized_with_their_observations() {
     let rows = "chrZ\t4\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n".to_string()
         + "chrZ\t4\t.\tA\tT\t.\tPASS\t.\tGT\t1/1\n"
         + &row(false, 4, "A", "T");
-    let output = f.run(
-        false,
-        &rows,
-        None,
-        &["--assembly", "GRCh38", "--variant-id-prefix", "nf:variant/"],
-    );
+    let output = f.run(false, &rows, None, &["--assembly", "GRCh38"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(stderr.contains("1 unnormalized variant(s) kept with 2 observation(s)"), "{stderr}");
@@ -377,11 +381,11 @@ fn vcf_strict_fails_on_records_that_cannot_be_given_an_identity() {
         ("chrZ\t4\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n", "contig is not in the seqmap"),
         (&row(false, 4, "A", "Z"), "non-nucleotide allele"),
     ] {
-        let output = f.run(false, rows, None, &["--strict"]);
+        let output = f.run_raw(false, rows, None, &["--strict"]);
         f.assert_rejected(output, message);
     }
     // A convertible file is untouched by --strict.
-    let output = f.run(false, &row(false, 4, "A", "T"), None, &["--strict"]);
+    let output = f.run_raw(false, &row(false, 4, "A", "T"), None, &["--strict"]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(f.json("alleles.ndjson").len(), 1);
 }
@@ -445,13 +449,11 @@ fn a_local_variant_id_needs_an_explicit_namespace() {
 
     // Refused, in both front ends, with the two ways out named.
     for (maf, rows) in [(false, &unknown_contig), (true, &junk_allele)] {
-        let output = f.run(maf, rows, None, &[]);
+        let output = f.run_raw(maf, rows, None, &[]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "expected a refusal: {stderr}");
-        assert!(stderr.contains("--variant-id-prefix was not supplied"), "{stderr}");
+        assert!(stderr.contains("--variant-id-prefix is required"), "{stderr}");
         assert!(stderr.contains("--strict"), "the alternative must be named: {stderr}");
-        // ...and no half-namespaced id is written before the refusal.
-        assert!(!f.json("alleles.ndjson").iter().any(|a| a["unnormalized"] == true));
     }
 
     // Supplying one is enough, and it is used verbatim — no `nf:` anywhere. The seqmap
@@ -461,7 +463,7 @@ fn a_local_variant_id_needs_an_explicit_namespace() {
         (false, &unknown_contig, "unknown:chrZ:4:A:T"),
         (true, &junk_allele, "unknown:chr1:4:A:Z"),
     ] {
-        let output = f.run(maf, rows, None, &["--variant-id-prefix", "https://ex.org/v/"]);
+        let output = f.run_raw(maf, rows, None, &["--variant-id-prefix", "https://ex.org/v/"]);
         assert!(output.status.success(), "{output:?}");
         let alleles = f.json("alleles.ndjson");
         assert_eq!(alleles.len(), 1);
@@ -469,20 +471,34 @@ fn a_local_variant_id_needs_an_explicit_namespace() {
         assert_eq!(f.json("obs.ndjson")[0]["variant"], alleles[0]["id"]);
     }
 
-    // `--strict` is the other way out, and needs no prefix at all.
+    // `--strict` is the other way out, and needs no prefix at all: it rejects the
+    // record rather than keeping it, so no local id is ever minted.
     for (maf, rows) in [(false, &unknown_contig), (true, &junk_allele)] {
-        let output = f.run(maf, rows, None, &["--strict"]);
+        let output = f.run_raw(maf, rows, None, &["--strict"]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{stderr}");
         assert!(!stderr.contains("--variant-id-prefix"), "strict needs no prefix: {stderr}");
     }
+}
 
-    // A file with nothing to reject never needs the flag: the requirement is lazy, so
-    // it cannot break a run that was already convertible.
+/// The namespace is settled from the arguments before the input is opened. A failed
+/// run's output holds only however much was written before the error, so a run that
+/// would need a prefix has to fail on argument grounds — not part-way through, having
+/// discarded everything converted up to the first unidentifiable record.
+#[test]
+fn the_namespace_requirement_is_checked_before_any_work() {
+    let f = Fixture::new();
     for maf in [false, true] {
-        let output = f.run(maf, &row(maf, 4, "A", "T"), None, &[]);
-        assert!(output.status.success(), "{output:?}");
-        assert_eq!(f.json("alleles.ndjson").len(), 1);
+        // Nothing in this input is unidentifiable, so a lazy check would let it
+        // through and only bite on the next, dirtier file.
+        let output = f.run_raw(maf, &row(maf, 4, "A", "T"), None, &[]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("--variant-id-prefix is required"), "{stderr}");
+        // Failing on argument grounds means no output file is even created, so there is
+        // no partial stream to mistake for a complete one.
+        assert!(!f.0.join("alleles.ndjson").exists(), "output was opened before the check");
+        assert!(!f.0.join("obs.ndjson").exists(), "output was opened before the check");
     }
 }
 
@@ -543,12 +559,7 @@ fn rejected_variant_and_observation_share_seqmap_assembly() {
     )
     .unwrap();
 
-    let output = f.run(
-        true,
-        &row(true, 4, "A", "Z"),
-        None,
-        &["--variant-id-prefix", "nf:variant/"],
-    );
+    let output = f.run(true, &row(true, 4, "A", "Z"), None, &[]);
     assert!(output.status.success(), "{:?}", output);
 
     let alleles = f.json("alleles.ndjson");

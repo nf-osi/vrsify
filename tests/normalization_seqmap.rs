@@ -68,6 +68,7 @@ fn seqmap_subcommand_and_normalization() {
                 out.to_str().unwrap(),
                 "--out-observations",
                 obs.to_str().unwrap(),
+                "--strict",
             ])
             .status()
             .unwrap();
@@ -118,6 +119,7 @@ fn seqmap_subcommand_and_normalization() {
                 "--seqmap", seqmap.to_str().unwrap(),
                 "--out-alleles", out.to_str().unwrap(),
                 "--out-observations", obs.to_str().unwrap(),
+                "--strict",
             ])
             .status()
             .unwrap();
@@ -132,6 +134,7 @@ fn seqmap_subcommand_and_normalization() {
                 "--seqmap", seqmap.to_str().unwrap(),
                 "--out-alleles", out.to_str().unwrap(),
                 "--out-observations", obs.to_str().unwrap(),
+                "--strict",
             ])
             .status()
             .unwrap();

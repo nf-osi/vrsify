@@ -28,11 +28,12 @@ jobs:
           set -euo pipefail
           ./target/release/vrsify --vcf examples/sample.vcf --seqmap examples/seqmap.tsv \
             --out-alleles /tmp/alleles.ndjson --out-observations /tmp/obs.ndjson \
-            --source "syn12345/test.vcf"
+            --source "syn12345/test.vcf" --strict
           grep -q 'ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt' /tmp/alleles.ndjson
           ./target/release/vrsify maf --maf examples/sample.maf --seqmap examples/seqmap.tsv \
             --out-alleles /tmp/maf_alleles.ndjson --out-observations /tmp/maf_obs.ndjson \
-            --study-id nst_nfosi_ntap --source "cbioportal:nst_nfosi_ntap/data_mutations.txt"
+            --study-id nst_nfosi_ntap --source "cbioportal:nst_nfosi_ntap/data_mutations.txt" \
+            --strict
           grep -q 'ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt' /tmp/maf_alleles.ndjson
 
   clippy:
