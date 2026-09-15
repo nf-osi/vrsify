@@ -293,12 +293,9 @@ fn padded_substitutions_reach_the_canonical_id_without_a_reference() {
     }
 }
 
-/// P2: the VCF path minted `ga4gh:VA.` ids for non-ACGTN REF/ALT strings (IUPAC codes,
-/// caller junk) that the MAF path routes away from VRS identity. Both front ends must
-/// enforce the same policy: no id, loud count, and the rest of the file still converts.
-///
-/// P3: and — again matching the MAF path — the rejected records are *kept* as
-/// `UnnormalizedVariant` nodes with their observations, not dropped.
+/// Non-ACGTN REF/ALT strings (IUPAC ambiguity codes, caller junk) get no `ga4gh:VA.`
+/// id in either front end: they are counted loudly, kept as `UnnormalizedVariant`
+/// nodes with their observations, and the rest of the file still converts.
 #[test]
 fn non_nucleotide_vcf_alleles_are_kept_unnormalized_not_minted() {
     let f = Fixture::new();
@@ -333,10 +330,9 @@ fn non_nucleotide_vcf_alleles_are_kept_unnormalized_not_minted() {
     }
 }
 
-/// P3: a VCF record on a contig the seqmap does not know was dropped with only a
-/// summary warning, so the samples carrying it vanished from the output — while the
-/// same row in a MAF was kept as an `UnnormalizedVariant`. "Nothing is discarded" has
-/// to mean the same thing in both front ends.
+/// A record on a contig the seqmap cannot identify is kept as an `UnnormalizedVariant`
+/// with one observation per carrying sample, so "nothing is discarded" means the same
+/// thing in both front ends.
 #[test]
 fn unknown_vcf_contigs_are_kept_unnormalized_with_their_observations() {
     let f = Fixture::new();
@@ -373,8 +369,7 @@ fn unknown_vcf_contigs_are_kept_unnormalized_with_their_observations() {
     assert_eq!(observations[2]["variant"], alleles[1]["id"]);
 }
 
-/// P3: `--strict` on the VCF path, mirroring the MAF one — refuse to write an
-/// unnormalized record at all.
+/// `--strict` refuses to write an unnormalized record at all, in either front end.
 #[test]
 fn vcf_strict_fails_on_records_that_cannot_be_given_an_identity() {
     let f = Fixture::new();
@@ -391,9 +386,9 @@ fn vcf_strict_fails_on_records_that_cannot_be_given_an_identity() {
     assert_eq!(f.json("alleles.ndjson").len(), 1);
 }
 
-/// P3: symbolic/structural ALTs stay an explicit scope exclusion rather than becoming
-/// `{ref}:{alt}`-keyed nodes that silently drop the `END`/`SVLEN` defining them — but
-/// they are counted, and the rest of the record set still converts.
+/// Symbolic/structural ALTs are an explicit scope exclusion, not an identity failure:
+/// a `{ref}:{alt}`-keyed node would silently drop the `END`/`SVLEN` that defines them.
+/// They are counted, and the rest of the record set still converts.
 #[test]
 fn symbolic_alts_are_counted_and_do_not_block_the_record() {
     let f = Fixture::new();
@@ -408,9 +403,8 @@ fn symbolic_alts_are_counted_and_do_not_block_the_record() {
     assert_eq!(alleles[0]["state"]["sequence"], "T");
 }
 
-/// P3: the VCF and MAF observation streams described the same relationship with two
-/// different `type` values (`VariantCall` vs `VariantObservation`), so a consumer
-/// needed a per-format loader for it.
+/// Both observation streams describe the same relationship, so both label it with the
+/// same `type` and one loader reads either.
 #[test]
 fn both_front_ends_emit_the_same_observation_type() {
     let f = Fixture::new();
@@ -440,10 +434,9 @@ fn identity_alleles_agree_across_naive_and_normalized_paths() {
     assert_eq!(ids[0], ids[1]);
 }
 
-/// P3: the local id of an unnormalizable record used to be hardcoded to the
-/// `nf:variant/` namespace, so anyone outside NF-OSI got ids asserting a namespace they
-/// have no claim to — and two orgs' outputs would collide on identical keys while
-/// claiming to be NF terms. There is no correct default, so the run now stops and asks.
+/// A local id is unique only within the namespace that minted it, so there is no
+/// correct namespace to default to: the run stops at the first unnormalizable record
+/// until `--variant-id-prefix` names one, and then uses it verbatim.
 #[test]
 fn a_local_variant_id_needs_an_explicit_namespace() {
     let f = Fixture::new();
@@ -493,9 +486,9 @@ fn a_local_variant_id_needs_an_explicit_namespace() {
     }
 }
 
-/// P3: only `GRCh38.p13` was aliased, so a `GRCh37.p13` row (and patch suffixes
-/// generally) read as an assembly mismatch and lost its VRS id. A patch release does
-/// not move primary-assembly coordinates, so it must match its base assembly.
+/// A GRC patch release adds scaffolds without moving primary-assembly coordinates, so
+/// a `GRCh37.p13` row is the same coordinate system as a `GRCh37` seqmap and must
+/// still earn a VRS id rather than reading as an assembly mismatch.
 #[test]
 fn patched_assembly_builds_are_not_a_mismatch() {
     let f = Fixture::new();

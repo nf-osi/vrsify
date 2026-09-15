@@ -473,10 +473,8 @@ pub struct Observation {
 impl Observation {
     pub fn to_json(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
-        // Both front ends emit `VariantObservation` (issue #95's class for "sample S
-        // carries variant V"). It used to be Beacon's `VariantCall` here and
-        // `VariantObservation` on the MAF path, which made the two streams need
-        // different loaders for the same relationship.
+        // Issue #95's class for "sample S carries variant V". Both front ends label
+        // the relationship the same way, so one loader handles either stream.
         m.insert("type".into(), "VariantObservation".into());
         m.insert("variant".into(), self.variant_id.clone().into());
         m.insert("biosample".into(), self.sample.clone().into());

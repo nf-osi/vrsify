@@ -702,8 +702,8 @@ mod tests {
     #[test]
     fn patch_releases_match_their_base_assembly() {
         // A patch release leaves primary-assembly coordinates alone, so `GRCh37.p13`
-        // rows must not be rejected as a mismatch against a `GRCh37` seqmap. Only
-        // `GRCh38.p13` used to be special-cased; the whole class is handled now.
+        // rows must not be rejected as a mismatch against a `GRCh37` seqmap. The whole
+        // patched class is handled, not a list of individual spellings.
         for (patched, base) in [
             ("GRCh38.p13", "GRCh38"),
             ("GRCh37.p13", "GRCh37"),
