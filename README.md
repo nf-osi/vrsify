@@ -6,10 +6,11 @@
 NDJSON streams:
 
 1. **alleles** — one [GA4GH VRS 2.0](https://vrs.ga4gh.org) object per distinct variant,
-   with its computed `ga4gh:VA.…` id;
+   with its computed `ga4gh:VA.…` id. This layer is the standard, byte-for-byte;
 2. **observations** — one record per sample (or per tumor sample, for MAF) pointing at
    that id, carrying the context-dependent details: genotype/zygosity, read depths, VAF,
-   study and file provenance, and any VEP/snpEff annotation.
+   study and file provenance, and any VEP/snpEff annotation. VRS has no class for this,
+   so this layer is `vrsify`'s own — see [The two output layers](#the-two-output-layers).
 
 Because a VRS id is essentially a digest of the variant itself (assembly sequence, position, 
 alternate bases), the *same* edit always hashes to the *same* id, no matter which file
@@ -111,7 +112,9 @@ vrsify \
   --reference GRCh38.fa \         # optional, but see "Indels" below
   --out-alleles alleles.ndjson \
   --out-observations obs.ndjson \
-  --source "syn12345/input.vcf"   # free-text provenance, recorded on each observation
+  --source "syn12345/input.vcf" \ # free-text provenance, recorded on each observation
+  --strict                       # required unless --variant-id-prefix is given; see
+                                 # "Data-quality behaviour"
 ```
 
 Split multi-allelic sites and left-align upstream (`bcftools norm -m- -f ref.fa`) as
@@ -132,13 +135,53 @@ vrsify maf \
   --out-alleles alleles.ndjson \
   --out-observations obs.ndjson \
   --study-id nst_nfosi_ntap \
-  --source "cbioportal:nst_nfosi_ntap/data_mutations.txt"
+  --source "cbioportal:nst_nfosi_ntap/data_mutations.txt" \
+  --strict                        # required unless --variant-id-prefix is given
 ```
 
 MAF observations carry the tumor/normal barcode pair, allele depths and derived VAF, the
 study id, and MAF's own annotation columns (`Variant_Classification`, `Consequence` as a
 **list** of SO terms, `HGVSc`/`HGVSp`/`HGVSp_Short`, `Transcript_ID`, `Gene`, `HGNC_ID`,
 `dbSNP_RS`, gnomAD AF). MAF has no `GT`, so there is no zygosity.
+
+## The two output layers
+
+`--out-alleles` is a GA4GH standard. `--out-observations` is not, and it is worth being
+explicit about which half you can hand to someone else.
+
+**`alleles.ndjson` — context-free, and conformant.** One object per distinct variant,
+`"type":"Allele"`, keyed by a `ga4gh:VA.` id that is a digest of the variant itself.
+Nothing about a sample, a cohort, or a file appears here, which is exactly why the id is
+stable: anyone converting the same edit computes the same bytes, so these join to
+ClinVar, gnomAD and any other VRS-identified source with no coordinate bookkeeping. The
+golden-fixture gate holds them byte-exact against GA4GH's own `models.yaml`.
+
+Two things in this stream are `vrsify`'s rather than VRS's, and you can switch both off:
+
+- `"fullyJustified": false` — an extra key on an otherwise conformant `Allele`, marking
+  an indel id computed without `--reference` (next section). It is excluded from the
+  digest, so the id is unaffected and dropping the key leaves plain VRS. Pass
+  `--reference` and it never appears.
+- `"type":"UnnormalizedVariant"` — a record that could not be given a VRS identity at
+  all, kept so its provenance survives (see
+  [Data-quality behaviour](#data-quality-behaviour)). `--strict` makes these a hard
+  error instead.
+
+So with `--reference --strict`, `alleles.ndjson` holds nothing but VRS `Allele` objects.
+
+**`obs.ndjson` — context-full, and ours.** VRS is context-free by design, so it has no
+class for "this sample carries this variant": `vrs-source.yaml` defines no observation,
+call, or genotype type at all. That half of the data still has to go somewhere, so it
+goes here in `vrsify`'s own vocabulary (`"type":"VariantObservation"`, the class from
+the NF knowledge-graph model in issue #95) — one record per sample per allele, holding
+the zygosity or the tumor depths and VAF, the study and file provenance, and any
+VEP/snpEff annotation. Its `variant` field is the join key back to layer one.
+
+Expect to map these field names onto your own model; they are a loading format, not a
+standard, and they are the part of the output most likely to move before v1. What is
+guaranteed is the shape: both front ends label the relationship with the same `type`,
+every `variant` value resolves to an id in the alleles stream (including the
+unnormalized ones), and nothing sample-specific is ever written onto an `Allele`.
 
 ## Indels, and why `--reference` matters
 
