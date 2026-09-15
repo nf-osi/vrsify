@@ -1,0 +1,2 @@
+{"alternateBases":"T","assemblyId":"GRCh38","biosample":"S1","referenceBases":"C","referenceName":"19","sourceContig":"chr19","sourceFile":"syn12345/test.vcf","sourcePos":44908822,"type":"VariantObservation","variant":"ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt","zygosity":"heterozygous"}
+{"alternateBases":"T","assemblyId":"GRCh38","biosample":"S2","referenceBases":"C","referenceName":"19","sourceContig":"chr19","sourceFile":"syn12345/test.vcf","sourcePos":44908822,"type":"VariantObservation","variant":"ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt","zygosity":"homozygous"}

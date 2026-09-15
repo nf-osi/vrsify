@@ -1,0 +1,7 @@
+# Rust build artifacts
+/target
+
+# Editor / OS noise
+*.rs.bk
+*.swp
+.DS_Store
