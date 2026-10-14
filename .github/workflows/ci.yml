@@ -1,0 +1,48 @@
+# CI gate: vrsify's value is byte-exact GA4GH VRS ids, so every push must pass the
+# golden-fixture suite (GA4GH functions.yaml / models.yaml, vrs-python cross-validated
+# ids) plus the P1/P2 regression tests, and reproduce the README's end-to-end example.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build, test (golden-fixture gate), README example
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --release
+      - name: README end-to-end example reproduces the GA4GH golden id
+        run: |
+          set -euo pipefail
+          ./target/release/vrsify --vcf examples/sample.vcf --seqmap examples/seqmap.tsv \
+            --out-alleles /tmp/alleles.ndjson --out-observations /tmp/obs.ndjson \
+            --source "syn12345/test.vcf" --strict
+          grep -q 'ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt' /tmp/alleles.ndjson
+          ./target/release/vrsify maf --maf examples/sample.maf --seqmap examples/seqmap.tsv \
+            --out-alleles /tmp/maf_alleles.ndjson --out-observations /tmp/maf_obs.ndjson \
+            --study-id nst_nfosi_ntap --source "cbioportal:nst_nfosi_ntap/data_mutations.txt" \
+            --strict
+          grep -q 'ga4gh:VA.0AePZIWZUNsUlQTamyLrjm2HWUw2opLt' /tmp/maf_alleles.ndjson
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
